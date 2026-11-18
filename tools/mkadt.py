@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
+"""Build the minimal Apple Device Tree for the DAVINCI/SWEET XNU port.
 
-Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+Only what the early boot path actually reads (see NOTES.md); shared SM7150
+MMIO addresses come from the SWEET live FDT. The tree identifies the physical
+board as davinci while retaining sweet compatibility for shared XNU drivers.
+Usage: mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
 """
 import hashlib, os, struct, sys
 
@@ -238,12 +240,12 @@ def build(seed=None, qemu=False, highmem=False, native=False):
     # dram-size we expose, so XNU maps it but never allocates into it.
     pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
 
-    # Identity of the iPhone X whose userland runs here: compatible[0] is
-    # hw.model/hw.target (D22AP), model is hw.machine/hw.product
-    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    # Keep the iPhone X identity for MobileGestalt and the iOS userland.
+    # The additional compatibles identify the physical Mi 9T board and keep
+    # SweetPlatformExpert matching while both devices share this XNU config.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,davinci') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),

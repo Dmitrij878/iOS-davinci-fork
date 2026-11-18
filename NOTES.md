@@ -1,4 +1,42 @@
-# iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
+# iOS 16 XNU port (shared SWEET baseline, DAVINCI target) - working notes
+
+## Agent handoff / DAVINCI work (2026-11-18)
+
+- Use the `gpu-bringup` source at `cd128b2`, not the older `main` branch.
+  GitHub Actions run [42659894924](https://github.com/devaxto/ios-davinci/actions/runs/42659894924)
+  built the XNU kernel through patch 0104; its `xnu-kernel` artifact is
+  available until 2027-02-07. The latest engineering log says image 0104 was
+  built but still awaiting its next device test. The 0103 test had live CA /
+  SpringBoard process activity but unresolved DPU scanout; do not describe it
+  as a verified usable iOS desktop.
+- The connected device reports `davinci`, unlocked, userdata size
+  `0xCE45FB000`. These were read-only fastboot queries; no partition was
+  written.
+- Local changes identify the physical board as `xiaomi,davinci` while keeping
+  `xiaomi,sweet` for shared driver matching and the iPhone X identity for the
+  iOS userland. README instructions now reflect the target and test limits.
+- The `xnu-kernel` workflow artifact was downloaded and its ZIP SHA-256
+  verified against GitHub metadata (`40c2c6e4...c298452`). The extracted
+  `kernel.development.sweet` matches the hash in the 0104 engineering notes
+  (`e163ddc6...ccea7c1`) and contains davinci GT9886 and 0104 DPU diagnostics.
+- A test boot image was built locally (`shim/out/davinci-kernel-test.img`,
+  SHA-256 `c8b1cdb342ba2069003c98a9360431344cfaf97c15bbe1589eeb9398f3095c3d`).
+  It has no embedded DTB or iOS root image and uses `sweetlog=0`,
+  `ufsrw=0`, `rootrw=0`.
+- `python3 tools/validate-repo.py` passes (104 patches, 24 Python tools, 7
+  shell scripts). The generated ADT check confirms both Xiaomi compatibles
+  while preserving D22AP / iPhone10,3. It warns that the iPhone X `/product`
+  node is absent because no local IPSW-derived ADT was provided.
+- `fastboot fetch boot` is unsupported by this bootloader, so the Mi 9T stock
+  DTB is still missing. No partition has been written and no boot image has
+  been flashed. The test image was sent with temporary `fastboot boot`;
+  fastboot returned `OKAY`, the user saw a blank screen, and the device
+  remained visible in fastboot afterward. This does not establish whether XNU
+  progressed; the image lacked the stock DTB and the iOS root.
+- Next: obtain the exact Mi 9T stock boot image/DTB and a legally obtained
+  iPhone X firmware input for local root preparation. Retest only with a
+  matching DTB and a safe root configuration. Do not write `userdata`
+  without a fresh, explicit confirmation immediately before that write.
 
 ## Agent handoff / active work (2026-11-08, latest)
 
