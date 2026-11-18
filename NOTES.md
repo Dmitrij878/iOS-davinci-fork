@@ -87,8 +87,11 @@
   `8eafcd20b86c2f51aeed683665008e1aeb7da5d4f76b54303d8b821f0802a176`.
   It was rebuilt with `mkbootimg` from the original kernel, payload, and DTB
   so the boot-image header ID matches the changed payload.
-  The modified userdata image and boot image both await a separate explicit
-  user confirmation before any device write or boot.
+  The user explicitly authorized flashing the sparse root image to userdata;
+  fastboot reported all 24/24 chunks `OKAY` and completed in 367.005 seconds.
+  No other partition was written. The temporary boot is still pending; after
+  a large flash the ABL may hang, so wait for the user to return to fastboot
+  manually before `fastboot boot`.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,
