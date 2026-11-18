@@ -5,13 +5,9 @@
 - Use the `gpu-bringup` source at `cd128b2`, not the older `main` branch.
   GitHub Actions run [42659894924](https://github.com/devaxto/ios-davinci/actions/runs/42659894924)
   built the XNU kernel through patch 0104; its `xnu-kernel` artifact is
-  available until 2027-02-07. The latest engineering log says image 0104 was
-  built but still awaiting its next device test. The 0103 test had live CA /
-  SpringBoard process activity but unresolved DPU scanout; do not describe it
-  as a verified usable iOS desktop.
-- The connected device reports `davinci`, unlocked, userdata size
-  `0xCE45FB000`. These were read-only fastboot queries; no partition was
-  written.
+  available until 2027-02-07. Earlier `sweet` boots showed live CA/SpringBoard
+  activity but unresolved DPU scanout; do not describe them as verified
+  davinci results or as a usable iOS desktop.
 - Local changes identify the physical board as `xiaomi,davinci` while keeping
   `xiaomi,sweet` for shared driver matching and the iPhone X identity for the
   iOS userland. README instructions now reflect the target and test limits.
@@ -20,24 +16,49 @@
   verified against GitHub metadata (`40c2c6e4...c298452`). The extracted
   `kernel.development.sweet` matches the hash in the 0104 engineering notes
   (`e163ddc6...ccea7c1`) and contains davinci GT9886 and 0104 DPU diagnostics.
-- A test boot image was built locally (`shim/out/davinci-kernel-test.img`,
-  SHA-256 `c8b1cdb342ba2069003c98a9360431344cfaf97c15bbe1589eeb9398f3095c3d`).
-  It has no embedded DTB or iOS root image and uses `sweetlog=0`,
-  `ufsrw=0`, `rootrw=0`.
-- `python3 tools/validate-repo.py` passes (104 patches, 24 Python tools, 7
-  shell scripts). The generated ADT check confirms both Xiaomi compatibles
-  while preserving D22AP / iPhone10,3. It warns that the iPhone X `/product`
-  node is absent because no local IPSW-derived ADT was provided.
-- `fastboot fetch boot` is unsupported by this bootloader, so the Mi 9T stock
-  DTB is still missing. No partition has been written and no boot image has
-  been flashed. The test image was sent with temporary `fastboot boot`;
-  fastboot returned `OKAY`, the user saw a blank screen, and the device
-  remained visible in fastboot afterward. This does not establish whether XNU
-  progressed; the image lacked the stock DTB and the iOS root.
-- Next: obtain the exact Mi 9T stock boot image/DTB and a legally obtained
-  iPhone X firmware input for local root preparation. Retest only with a
-  matching DTB and a safe root configuration. Do not write `userdata`
-  without a fresh, explicit confirmation immediately before that write.
+- The user supplied Mi 9T `boot.img` and iPhone X 16.7.16 IPSW (build 20H392,
+  product types iPhone10,3/iPhone10,6). The DTB was extracted from the Android
+  boot image (346,902 bytes, SHA-256
+  `29cc551e43c7e83a63867685fcafbb7d7f327a757c3a7b3d661878f793cf4fdd`).
+  IPSW DMGs and `DeviceTree.d22ap.im4p` were extracted locally; the decoded
+  D22AP tree supplied `/product` (`product-name = iPhone X`) to the generated
+  davinci ADT.
+- Temporary XNU test image `/tmp/davinci-test-with-dtb.img` (SHA-256
+  `34c2d9079b4a06380cb4bbb3353ffe03d0d1cd783c81af4d24a6181d28fc46ad`)
+  embeds the stock DTB and uses the 0104 kernel. It was started with
+  `fastboot boot` only; no partition was written. User observed `SWEET EARLY
+  20: kprintf startup complete`, an Apple-style progress bar near 35%, and
+  green display artifacts. This confirms XNU reached normal kprintf startup,
+  not that iOS userland completed boot. The display artifact cause is unknown.
+- iOS root image `/mnt/wrk/davinci-iosroot.img` was built as a 16 GiB,
+  case-sensitive journaled HFS+ volume from the supplied IPSW. `fsck.hfsplus`
+  repaired its folder-count metadata and the read-only verification then
+  passed. Raw-image SHA-256:
+  `c8895fb564f83e920cb6ae9328fafe7056ceafc55cba52fb6a3a7632beae8ad7`.
+  Android sparse image `/mnt/wrk/davinci-iosroot.simg` was generated
+  (SHA-256 `480e86543f2a8365c84b7a6456c9dcaaa6bd0b51ccb3b4e2b10cf9d0d9193065`,
+  16 GiB expanded size); `simg2img` round-trip matches the raw source exactly.
+- The user explicitly confirmed the destructive write. `fastboot -S 512M flash
+  userdata /mnt/wrk/davinci-iosroot.simg` completed all 24/24 chunks in
+  368.351 s. Android user data on `userdata` is erased. No other partition was
+  written.
+- Full-root boot image `/mnt/wrk/davinci-ios-boot.img` (SHA-256
+  `5bf131c2c8beb699ddea8b6ea3f9732a5a965180f3aaadbd06777b80a13d0d03`) embeds
+  the stock DTB and the generated ADT. The first `fastboot boot` after flashing
+  stalled at `Sending`; after the user manually re-entered fastboot, retry
+  returned `OKAY`. USB was absent after 60 s. Photos showed console output,
+  then a white rectangular image with vertical stripes. User clarified the
+  bright center line is physical panel damage, not a software artifact. No
+  SpringBoard/home screen is confirmed; the white content's cause is unresolved.
+- A/B image `/mnt/wrk/davinci-ios-cpucopy-boot.img` adds `sweetfb_flip=0` to
+  force the CPU-copy path (the default image uses the DPU flip path); SHA-256
+  `f1b116f19082b2729fdca16f5b86ed533b53efb55453f67800f3bb1d92f1110c`.
+  The user manually returned the phone to fastboot and `fastboot boot` returned
+  `OKAY`. The screen/USB result for this comparison boot is pending.
+- Do not commit the user-supplied firmware/boot image or generated root image.
+  If another persistent write is considered, obtain fresh explicit
+  confirmation immediately before it. Keep bootloaders, recovery, modem,
+  persist and backups intact.
 
 ## Agent handoff / active work (2026-11-08, latest)
 
