@@ -73,7 +73,7 @@
   `/dev/block/sda32` (55,371,083,776 bytes; no `/sdcard` used), but found no
   `SWEETLOG` header. The tested CPU-copy boot command line explicitly had
   `sweetlog=0`, which disables persistent log writes.
-- Prepared, but did not flash, a local copy of the root image with
+- Prepared a local copy of the root image with
   `/var/mobile/Library/Preferences/com.apple.migration.plist` containing
   `LastSystemVersion=20H392` (the file was absent in the original image).
   The new file is owned by 501:501, mode 0644. Read-only HFS+ fsck passed and
@@ -81,22 +81,41 @@
   `bb63888b23f52c86516aa26907866f689a40d0826ed5a315f10b4ef0a57af0ee`;
   sparse SHA-256:
   `eb35b9c769c90dbbdb91fa495a629119d81e721e7822345929ff1d43a2115a25`.
-- Prepared, but did not boot, a copy of the CPU-copy boot image with
+- The user explicitly authorized flashing that sparse image to userdata;
+  fastboot reported all 24/24 chunks `OKAY` and completed in 367.005 seconds.
+  No other partition was written.
+- Prepared and temporarily booted a copy of the CPU-copy boot image with
   `sweetlog=1 sweetfb_flip=0 sweetfb_noconsole=1`:
   `/mnt/wrk/davinci-ios-cpucopy-noconsole-boot.img`, SHA-256
   `8eafcd20b86c2f51aeed683665008e1aeb7da5d4f76b54303d8b821f0802a176`.
   It was rebuilt with `mkbootimg` from the original kernel, payload, and DTB
   so the boot-image header ID matches the changed payload.
-  The user explicitly authorized flashing the sparse root image to userdata;
-  fastboot reported all 24/24 chunks `OKAY` and completed in 367.005 seconds.
-  No other partition was written. The user manually returned to fastboot
-  after the large flash; `fastboot boot
+  The user manually returned to fastboot after the large flash; `fastboot boot
   /mnt/wrk/davinci-ios-cpucopy-noconsole-boot.img` returned `Sending` and
   `Booting` `OKAY` in 0.662 seconds. User reports a static Apple logo with no
   progress bar after 5 minutes. The command line still contains `-noprogress`,
   which suppresses the XNU graphical progress indicator; the static logo
-  alone does not establish whether userland completed boot. Pull the enabled
-  persistent log from recovery before another boot.
+  alone does not establish whether userland completed boot.
+- The subsequent recovery pull succeeded: 198,106 console bytes, flush #62,
+  saved as `/mnt/wrk/davinci-noconsole-boot.txt`.
+  It shows `userdata` mounted read-write, `exec SpringBoard`, and `exec
+  backboardd`. `backboardd` created 1125x2436 BGRA surfaces and at least four
+  CPU-copy presentations to the 1080x2340 panel. No SpringBoard/backboardd
+  crash or kernel panic was recorded. Five SpringBoard samples have the same
+  main-thread wait stack.
+- Symbolication of that stack shows
+  `_mach_msg2_trap -> __dispatch_mach_send_and_wait_for_reply ->
+  _xpc_connection_send_message_with_reply_sync ->
+  ___NSXPCCONNECTION_IS_WAITING_FOR_A_SYNCHRONOUS_REPLY__ ->
+  -[NSXPCConnection _sendInvocation:...] -> __LSCopyServerStore ->
+  -[LSApplicationRecord _initWithNode:...]`. It also passes through
+  `___LAUNCH_SERVICES_WAS_ASKED_TO_PERFORM_BLOCKING_IO_ON_THE_MAIN_QUEUE__`.
+  This points to a synchronous LaunchServices/`lsd` database query on
+  SpringBoard's main thread. `lsd` and `com.apple.datamigrator` launch entries
+  are present, but the log does not prove that migration is the direct cause.
+- Next diagnostic: boot a temporary image with `sweetsample=lsd,SpringBoard,
+  backboardd` and without `-noprogress`, retaining `sweetlog=1` and
+  `sweetfb_noconsole=1`; inspect `lsd`'s stack and show the boot indicator.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,
