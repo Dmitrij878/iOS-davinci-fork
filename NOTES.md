@@ -15,6 +15,7 @@
 - Local changes identify the physical board as `xiaomi,davinci` while keeping
   `xiaomi,sweet` for shared driver matching and the iPhone X identity for the
   iOS userland. README instructions now reflect the target and test limits.
+- Source/documentation commit: `e66dfa8` (`fix: identify davinci in generated device tree`).
 - The `xnu-kernel` workflow artifact was downloaded and its ZIP SHA-256
   verified against GitHub metadata (`40c2c6e4...c298452`). The extracted
   `kernel.development.sweet` matches the hash in the 0104 engineering notes
