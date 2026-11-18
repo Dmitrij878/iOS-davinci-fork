@@ -61,6 +61,11 @@
   previous default-flip run, it supports (but does not prove) that direct DPU
   flipping caused the earlier display result; the runs are not a controlled
   same-state visual comparison.
+- A later user photo shows built-in `SMP` thread samples for `backboardd` and
+  `SpringBoard[261]`. This confirms both processes are running far enough for
+  the kernel sampler to capture their threads. The photo itself shows sampler
+  console output, not a visible SpringBoard home screen; GUI readiness remains
+  unverified.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,
