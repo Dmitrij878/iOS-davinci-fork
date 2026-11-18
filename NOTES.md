@@ -92,7 +92,11 @@
   No other partition was written. The user manually returned to fastboot
   after the large flash; `fastboot boot
   /mnt/wrk/davinci-ios-cpucopy-noconsole-boot.img` returned `Sending` and
-  `Booting` `OKAY` in 0.662 seconds. No visual result is confirmed yet.
+  `Booting` `OKAY` in 0.662 seconds. User reports a static Apple logo with no
+  progress bar after 5 minutes. The command line still contains `-noprogress`,
+  which suppresses the XNU graphical progress indicator; the static logo
+  alone does not establish whether userland completed boot. Pull the enabled
+  persistent log from recovery before another boot.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,
