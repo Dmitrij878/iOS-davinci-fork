@@ -84,7 +84,9 @@
 - Prepared, but did not boot, a copy of the CPU-copy boot image with
   `sweetlog=1 sweetfb_flip=0 sweetfb_noconsole=1`:
   `/mnt/wrk/davinci-ios-cpucopy-noconsole-boot.img`, SHA-256
-  `0f336f78999415d245230dd372070da3b72ea5f67dbc7862596f46eeebef664f`.
+  `8eafcd20b86c2f51aeed683665008e1aeb7da5d4f76b54303d8b821f0802a176`.
+  It was rebuilt with `mkbootimg` from the original kernel, payload, and DTB
+  so the boot-image header ID matches the changed payload.
   The modified userdata image and boot image both await a separate explicit
   user confirmation before any device write or boot.
 - Do not commit the user-supplied firmware/boot image or generated root image.
