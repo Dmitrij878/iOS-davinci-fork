@@ -116,6 +116,13 @@
 - Next diagnostic: boot a temporary image with `sweetsample=lsd,SpringBoard,
   backboardd` and without `-noprogress`, retaining `sweetlog=1` and
   `sweetfb_noconsole=1`; inspect `lsd`'s stack and show the boot indicator.
+- Prepared but not yet booted
+  `/mnt/wrk/davinci-ios-ls-sample-boot.img` (SHA-256
+  `f4f491f12ef600d4668016671f1da45aba4c4b7dca5511b525276290d86a5a32`).
+  It removes `-noprogress` and adds `sweetsample=lsd,SpringBoard,backboardd`;
+  kernel and DTB match the previous diagnostic image byte-for-byte, and the
+  rebuilt image was unpacked to verify its payload and header. No device
+  operation has been performed with this image yet.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,
