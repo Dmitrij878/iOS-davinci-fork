@@ -54,7 +54,13 @@
   force the CPU-copy path (the default image uses the DPU flip path); SHA-256
   `f1b116f19082b2729fdca16f5b86ed533b53efb55453f67800f3bb1d92f1110c`.
   The user manually returned the phone to fastboot and `fastboot boot` returned
-  `OKAY`. The screen/USB result for this comparison boot is pending.
+  `OKAY`. In the user's subsequent 47-second video, the CPU-copy boot shows an
+  Apple logo and progress bar; the filled segment appears to advance during
+  the clip. No SpringBoard/home screen appears. This is consistent with active
+  boot work, not a frozen splash. Compared with the white block seen on the
+  previous default-flip run, it supports (but does not prove) that direct DPU
+  flipping caused the earlier display result; the runs are not a controlled
+  same-state visual comparison.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,
