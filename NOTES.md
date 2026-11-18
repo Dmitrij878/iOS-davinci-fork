@@ -66,6 +66,27 @@
   the kernel sampler to capture their threads. The photo itself shows sampler
   console output, not a visible SpringBoard home screen; GUI readiness remains
   unverified.
+- Follow-up (2026-11-18): the user reports that the console repeats sampler
+  lines without visible progress. `SMP` samples begin after 90 seconds and
+  repeat every 120 seconds; they are not a forward-progress counter. In
+  recovery, `tools/sweet-log-pull.sh` read the userdata tail from
+  `/dev/block/sda32` (55,371,083,776 bytes; no `/sdcard` used), but found no
+  `SWEETLOG` header. The tested CPU-copy boot command line explicitly had
+  `sweetlog=0`, which disables persistent log writes.
+- Prepared, but did not flash, a local copy of the root image with
+  `/var/mobile/Library/Preferences/com.apple.migration.plist` containing
+  `LastSystemVersion=20H392` (the file was absent in the original image).
+  The new file is owned by 501:501, mode 0644. Read-only HFS+ fsck passed and
+  sparse-image round-trip was byte-identical. Raw SHA-256:
+  `bb63888b23f52c86516aa26907866f689a40d0826ed5a315f10b4ef0a57af0ee`;
+  sparse SHA-256:
+  `eb35b9c769c90dbbdb91fa495a629119d81e721e7822345929ff1d43a2115a25`.
+- Prepared, but did not boot, a copy of the CPU-copy boot image with
+  `sweetlog=1 sweetfb_flip=0 sweetfb_noconsole=1`:
+  `/mnt/wrk/davinci-ios-cpucopy-noconsole-boot.img`, SHA-256
+  `0f336f78999415d245230dd372070da3b72ea5f67dbc7862596f46eeebef664f`.
+  The modified userdata image and boot image both await a separate explicit
+  user confirmation before any device write or boot.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,
