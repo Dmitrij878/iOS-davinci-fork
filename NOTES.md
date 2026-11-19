@@ -149,13 +149,15 @@
   Patch 0082 defaults this flag to 1, which probes the GT9886 controller but
   deliberately disables touch-event polling. This is the likely explanation
   for the unresponsive touchscreen; it is not yet a hardware-failure finding.
-- Prepared but not yet booted
+- Touch-enabled test image
   `/mnt/wrk/davinci-ios-touch-enabled-boot.img` (SHA-256
   `13a316e079925ade2c781df391d9ad11999677adb083d9a9e877c3a41629c19d`).
   It adds `davinci_touch_probeonly=0` to enable GT9886 polling. The image was
   unpacked and verified: kernel and DTB are byte-identical to the current
-  diagnostic image, and all other payload boot arguments are retained. The
-  phone remains on the Hello screen; this new image has not been booted.
+  diagnostic image, and all other payload boot arguments are retained. On
+  2026-11-19 it was temporarily booted from fastboot (`Sending` and `Booting`
+  both `OKAY`); no partition was written. Awaiting the user's touchscreen
+  test after the driver has had time to initialize.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,
