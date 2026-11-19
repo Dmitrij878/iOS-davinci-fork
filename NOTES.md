@@ -138,8 +138,10 @@
   or a performance fix. On 2026-11-19 the user authorized a temporary boot
   from fastboot; `Sending` and `Booting` both returned `OKAY`, and no
   partition was written. The user reports the image reaches Hello but feels
-  just as laggy. This is expected because mode 2 does not submit GPU work or
-  render iOS; bootloader acceptance alone does not confirm GPU initialization.
+  just as laggy. A later 121-second user video shows Setup progressing through
+  region and Wi-Fi selection to the “Apps & Data” screen. This is expected
+  because mode 2 does not submit GPU work or render iOS; bootloader
+  acceptance alone does not confirm GPU initialization.
   The mode-2 persistent log has not yet been pulled, so the chip ID and power
   result remain unverified. The user also reports wired data transfer is not
   working from the running iOS environment.
@@ -174,10 +176,17 @@
   diagnostic image, and all other payload boot arguments are retained. On
   2026-11-19 it was temporarily booted from fastboot (`Sending` and `Booting`
   both `OKAY`); no partition was written. The user confirms touch now responds
-  after a 2-3 second delay, but a swipe is incomplete and Setup Assistant
-  returns to Hello. This image still uses `cpus=1` and leaves
-  `sweetgpu` at its default read-only probe mode; neither GPU power-up nor
-  GPU rendering was tested.
+  after a 2-3 second delay; an initial swipe attempt returned to Hello. This
+  image still uses `cpus=1` and leaves `sweetgpu` at its default read-only
+  probe mode; neither GPU power-up nor GPU rendering was tested.
+- Prepared, but not yet booted,
+  `/mnt/wrk/davinci-ios-multicore-touch-boot.img` (SHA-256
+  `b3ea6c17d3fa7ff83d15309b90204e17dbbbb214e4db243cb669707909df3d0a`).
+  It changes the diagnostic payload to `cpus=6` and `sweetgpu=1`, retaining
+  `davinci_touch_probeonly=0` and the CPU-copy display path. Unpack
+  verification confirms the kernel and DTB are unchanged. This is intended
+  to test responsiveness without powering up the GPU; the image has not been
+  booted.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,

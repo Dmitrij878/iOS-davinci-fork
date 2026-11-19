@@ -16,8 +16,9 @@ This is experimental bring-up work, not a daily-use operating system.
   build, not a stable davinci boot. On 2026-11-19, a temporary 0104-based
   image reached the multilingual iOS Setup Assistant “Hello” screen on
   davinci. With GT9886 touch polling enabled, the user reports touches are
-  recognized after 2-3 seconds, but a swipe does not complete. Setup has not
-  been completed and a usable Home screen is not confirmed.
+  recognized after 2-3 seconds. A later user video shows Setup progressing
+  through region and Wi-Fi selection to “Apps & Data”; setup is not complete
+  and a usable Home screen is not confirmed.
 - Repository validation and the 0104 CI kernel build have passed. The
   verified kernel artifact is in `xnu/out-0104/kernel.development.sweet`.
   The current Hello-screen result is an experimental boot, not a stable
