@@ -1,6 +1,6 @@
 # iOS 16 XNU port (shared SWEET baseline, DAVINCI target) - working notes
 
-## Agent handoff / DAVINCI work (2026-11-18)
+## Agent handoff / DAVINCI work (2026-11-19)
 
 - Use the `gpu-bringup` source at `cd128b2`, not the older `main` branch.
   GitHub Actions run [42659894924](https://github.com/devaxto/ios-davinci/actions/runs/42659894924)
@@ -113,16 +113,36 @@
   This points to a synchronous LaunchServices/`lsd` database query on
   SpringBoard's main thread. `lsd` and `com.apple.datamigrator` launch entries
   are present, but the log does not prove that migration is the direct cause.
-- Next diagnostic: boot a temporary image with `sweetsample=lsd,SpringBoard,
-  backboardd` and without `-noprogress`, retaining `sweetlog=1` and
-  `sweetfb_noconsole=1`; inspect `lsd`'s stack and show the boot indicator.
-- Prepared but not yet booted
+- The next diagnostic boot used `sweetsample=lsd,SpringBoard,backboardd`
+  without `-noprogress`; it was accepted by `fastboot boot` and wrote no
+  partitions. Its recovered log is
+  `/mnt/wrk/davinci-ls-sample-boot.txt` (170,712 console bytes, flush #36).
+- The `lsd` samples show its startup work waiting in
+  `-_LSInstallProgressService performJournalRecovery`; another worker is in
+  `restoreInactiveInstalls`, with a blocking LaunchServices fetch reporting
+  `LAUNCH_SERVICES_CLIENTS_ARE_WAITING_FOR_THE_DATABASE_TO_FINISH_SEEDING`.
+  The stack also passes through MobileGestalt while generating an install
+  identity (`__GenerateBuiltInAppInstallSessionID`). SpringBoard remains
+  synchronously waiting on `__LSCopyServerStore`. This narrows the startup
+  dependency chain but does not yet identify the underlying database or
+  MobileGestalt failure.
+- The temporary LaunchServices sampler image
   `/mnt/wrk/davinci-ios-ls-sample-boot.img` (SHA-256
   `f4f491f12ef600d4668016671f1da45aba4c4b7dca5511b525276290d86a5a32`).
   It removes `-noprogress` and adds `sweetsample=lsd,SpringBoard,backboardd`;
-  kernel and DTB match the previous diagnostic image byte-for-byte, and the
-  rebuilt image was unpacked to verify its payload and header. No device
-  operation has been performed with this image yet.
+  its kernel and DTB match the previous diagnostic image byte-for-byte. It
+  was subsequently booted temporarily, then replaced by the MobileGestalt
+  diagnostic boot below.
+- On 2026-11-19, temporarily booted
+  `/mnt/wrk/davinci-ios-mg-sample-boot.img` (SHA-256
+  `69f26760a16a6be376d2948590e634fa15dd40cefe5f0fa860b48ec04f44b6b6`) with
+  `sweetsample=lsd,MobileGestaltHelper,installcoordinationd`; `sweetlog=1`,
+  `sweetfb_flip=0`, and `sweetfb_noconsole=1` remain enabled, and
+  `-noprogress` remains removed. The image uses the same kernel and DTB and
+  was accepted by `fastboot boot`; no partition was written. The user reports
+  the device now displays the multilingual “Hello” welcome screen (Setup
+  Assistant), the first confirmed iOS user interface on davinci. The phone
+  was left running iOS; this boot's persistent log has not yet been pulled.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,
