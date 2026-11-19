@@ -179,14 +179,15 @@
   after a 2-3 second delay; an initial swipe attempt returned to Hello. This
   image still uses `cpus=1` and leaves `sweetgpu` at its default read-only
   probe mode; neither GPU power-up nor GPU rendering was tested.
-- Prepared, but not yet booted,
+- Multicore touch test image
   `/mnt/wrk/davinci-ios-multicore-touch-boot.img` (SHA-256
   `b3ea6c17d3fa7ff83d15309b90204e17dbbbb214e4db243cb669707909df3d0a`).
   It changes the diagnostic payload to `cpus=6` and `sweetgpu=1`, retaining
   `davinci_touch_probeonly=0` and the CPU-copy display path. Unpack
-  verification confirms the kernel and DTB are unchanged. This is intended
-  to test responsiveness without powering up the GPU; the image has not been
-  booted.
+  verification confirms the kernel and DTB are unchanged. On 2026-11-19 the
+  user authorized this temporary boot from fastboot; `Sending` and `Booting`
+  both returned `OKAY`, and no partition was written. Awaiting the user's
+  report on Setup progress and touch responsiveness.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,

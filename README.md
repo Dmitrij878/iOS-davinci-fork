@@ -26,10 +26,12 @@ This is experimental bring-up work, not a daily-use operating system.
 - Wi-Fi, cellular, audio, camera, sensors, SEP/Face ID, and a working GPU
   remain unavailable or experimental. The inherited port disables or stubs
   parts of iOS security; do not use personal accounts or data.
-- The current test uses `cpus=1`. A `sweetgpu=2` boot only attempts CX power
+- Earlier UI tests used `cpus=1`. A `sweetgpu=2` boot only attempts CX power
   and chip-ID access; the user reports no change in UI lag, as expected
-  without GPU rendering. The mode-2 log has not yet been checked. GPU
-  driver bring-up is separate from accelerating iOS CoreAnimation; see
+  without GPU rendering. Its log has not yet been checked. The latest
+  temporary comparison uses `cpus=6`, touch polling enabled, and
+  `sweetgpu=1` (read-only probe); its responsiveness result is pending.
+  GPU driver bring-up is separate from accelerating iOS CoreAnimation; see
   [docs/GPU.md](docs/GPU.md).
 
 The Mi 9T's 1080x2340 display and GT9886 touchscreen are distinct from the
