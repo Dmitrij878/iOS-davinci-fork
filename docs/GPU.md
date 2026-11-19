@@ -302,7 +302,9 @@ Hello-screen test is CPU-rendered (`sweetgpu` default probe mode); it does not
 use the GPU. The persistent log identifies `Adreno 618 (davinci/sweet)` but
 reports CX/GX gated and skips GPU MMIO in mode 1. The next controlled
 hardware step is `sweetgpu=2` (power CX and read the chip ID), not enabling
-the IOKit accelerator or expecting iOS rendering. Real, unmodified iOS Metal
+the IOKit accelerator or expecting iOS rendering. This mode-2 image was
+temporarily booted on 2026-11-19; fastboot accepted it, but GPU initialization
+is not yet confirmed from the persistent log. Real, unmodified iOS Metal
 remains blocked on the AGX-to-a6xx shader-translation problem described
 above. See `docs/METAL-PORT.md`.
 

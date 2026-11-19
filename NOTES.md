@@ -135,7 +135,10 @@
   It adds `sweetgpu=2` to the touch-enabled diagnostic payload. Unpack
   verification confirms the kernel and DTB are unchanged. Mode 2 is the first
   active GPU test: CX power/clocks and chip-ID read only; it is not a renderer
-  or a performance fix. This temporary image has not been booted.
+  or a performance fix. On 2026-11-19 the user authorized a temporary boot
+  from fastboot; `Sending` and `Booting` both returned `OKAY`, and no
+  partition was written. Awaiting screen feedback and a later persistent-log
+  pull; bootloader acceptance alone does not confirm GPU initialization.
 - The temporary LaunchServices sampler image
   `/mnt/wrk/davinci-ios-ls-sample-boot.img` (SHA-256
   `f4f491f12ef600d4668016671f1da45aba4c4b7dca5511b525276290d86a5a32`).
