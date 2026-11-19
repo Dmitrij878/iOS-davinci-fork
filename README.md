@@ -30,7 +30,8 @@ This is experimental bring-up work, not a daily-use operating system.
   and chip-ID access; the user reports no change in UI lag, as expected
   without GPU rendering. Its log has not yet been checked. The latest
   temporary comparison uses `cpus=6`, touch polling enabled, and
-  `sweetgpu=1` (read-only probe); its responsiveness result is pending.
+  `sweetgpu=1` (read-only probe). The user reports smoother Hello animation,
+  but Setup Assistant later stopped responding; this boot's log is pending.
   GPU driver bring-up is separate from accelerating iOS CoreAnimation; see
   [docs/GPU.md](docs/GPU.md).
 

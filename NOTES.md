@@ -186,8 +186,13 @@
   `davinci_touch_probeonly=0` and the CPU-copy display path. Unpack
   verification confirms the kernel and DTB are unchanged. On 2026-11-19 the
   user authorized this temporary boot from fastboot; `Sending` and `Booting`
-  both returned `OKAY`, and no partition was written. Awaiting the user's
-  report on Setup progress and touch responsiveness.
+  both returned `OKAY`, and no partition was written. The user reports that
+  the Setup Assistant later stopped responding for an unknown reason, but the
+  Hello animation now renders almost without visible stutter. This is a
+  reported improvement over `cpus=1`; `sweetgpu=1` kept the GPU in
+  read-only probe mode, so it is evidence that CPU availability affected
+  visual smoothness, not that GPU rendering works. The current assistant hang
+  is uninvestigated; this boot's persistent log has not been pulled.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,

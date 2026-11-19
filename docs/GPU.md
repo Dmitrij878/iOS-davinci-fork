@@ -14,11 +14,12 @@ Today CoreAnimation runs `CA::OGL::SW` (CPU). backboardd already polls
 The user has confirmed the davinci test image reaches iOS Setup Assistant
 ("Hello"). GT9886 touch events are recognized with
 `davinci_touch_probeonly=0`, but input has a reported 2-3 second delay and a
-swipe does not complete. That test image uses `cpus=1` and leaves `sweetgpu`
-at its default read-only probe mode. This is not evidence that GPU
-acceleration is active. For responsiveness, first compare a multi-core
-software-rendering boot against the single-core baseline; keep GPU power-up
-and rendering as a separate lab experiment.
+swipe was initially incomplete. The `cpus=1` image left `sweetgpu` at its
+default read-only probe mode. In a later `cpus=6` CPU-rendering test, the user
+reports the Hello animation is nearly free of stutter, but Setup Assistant
+stopped responding. This supports a CPU-count effect on visual smoothness;
+it is not evidence of GPU acceleration and does not resolve the Setup hang.
+Keep GPU power-up and rendering as separate lab work.
 
 Two independent walls. Only one of them can be moved with kernel code:
 
