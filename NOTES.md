@@ -129,6 +129,13 @@
 - The same recovered log reports `SWEET GPU: Adreno 618 (davinci/sweet) mode 1`,
   but CX/GX are gated; the read-only default probe therefore skips GPU MMIO.
   No GPU power-up, command submission, or rendering was tested in this boot.
+- Prepared, but not yet booted, `/mnt/wrk/davinci-ios-gpu-probe-boot.img`
+  (SHA-256
+  `cf76da5e091762d1afdde9557ccbd3624d8b63b0daee319a1684ac884227e8e5`).
+  It adds `sweetgpu=2` to the touch-enabled diagnostic payload. Unpack
+  verification confirms the kernel and DTB are unchanged. Mode 2 is the first
+  active GPU test: CX power/clocks and chip-ID read only; it is not a renderer
+  or a performance fix. This temporary image has not been booted.
 - The temporary LaunchServices sampler image
   `/mnt/wrk/davinci-ios-ls-sample-boot.img` (SHA-256
   `f4f491f12ef600d4668016671f1da45aba4c4b7dca5511b525276290d86a5a32`).
