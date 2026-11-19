@@ -13,17 +13,21 @@ This is experimental bring-up work, not a daily-use operating system.
   the GT9886 touch controller, display controller, and Adreno 618.
 - GitHub Actions run [42659894924](https://github.com/devaxto/ios-davinci/actions/runs/42659894924)
   successfully built the XNU kernel through patch 0104. This verifies the
-  build, not a stable davinci boot.
-- The latest engineering notes record a davinci display/CA test with an
-  unresolved DPU scanout issue; the 0104 image was awaiting a device test.
-  They do not establish a usable SpringBoard. Results recorded only for
-  `sweet` must not be treated as davinci test results.
+  build, not a stable davinci boot. On 2026-11-19, a temporary 0104-based
+  image reached the multilingual iOS Setup Assistant “Hello” screen on
+  davinci. With GT9886 touch polling enabled, the user reports touches are
+  recognized after 2-3 seconds, but a swipe does not complete. Setup has not
+  been completed and a usable Home screen is not confirmed.
 - Repository validation and the 0104 CI kernel build have passed. The
-  verified kernel artifact is in `xnu/out-0104/kernel.development.sweet`;
-  that does not establish that the latest image boots to a usable interface.
+  verified kernel artifact is in `xnu/out-0104/kernel.development.sweet`.
+  The current Hello-screen result is an experimental boot, not a stable
+  daily-use system.
 - Wi-Fi, cellular, audio, camera, sensors, SEP/Face ID, and a working GPU
   remain unavailable or experimental. The inherited port disables or stubs
   parts of iOS security; do not use personal accounts or data.
+- The current touch test uses `cpus=1` and leaves `sweetgpu` in its default
+  read-only probe mode. GPU driver bring-up is separate from accelerating
+  iOS CoreAnimation; see [docs/GPU.md](docs/GPU.md).
 
 The Mi 9T's 1080x2340 display and GT9886 touchscreen are distinct from the
 Redmi Note 10 Pro's 1080x2400 display and GT9896 touchscreen. Davinci uses an

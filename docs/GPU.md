@@ -9,7 +9,16 @@ Today CoreAnimation runs `CA::OGL::SW` (CPU). backboardd already polls
 `IOProviderClass IOAcceleratorES`, `AGXAccelerator` and
 `IOAcceleratorESLegacy` and finds nothing.
 
-## Where this stands (2026-10-29)
+## Where this stands (2026-11-19)
+
+The user has confirmed the davinci test image reaches iOS Setup Assistant
+("Hello"). GT9886 touch events are recognized with
+`davinci_touch_probeonly=0`, but input has a reported 2-3 second delay and a
+swipe does not complete. That test image uses `cpus=1` and leaves `sweetgpu`
+at its default read-only probe mode. This is not evidence that GPU
+acceleration is active. For responsiveness, first compare a multi-core
+software-rendering boot against the single-core baseline; keep GPU power-up
+and rendering as a separate lab experiment.
 
 Two independent walls. Only one of them can be moved with kernel code:
 
@@ -285,7 +294,17 @@ by backboardd.
 
 ## Phases
 
-Status 2026-10-29 night: Track A present path is 0086+0087+0089 (0088 always-on contiguous alloc made the GUI worse; contig is gated behind sweetfb_flip=1 again). Daily boot = shim-boot-smooth.img (0087 kernel, sweetfb_noconsole=1 sweetfb_cache=1 cpus=8, no flip). GPU side still stops at CX powered / chip id until tools/gpu-fw.py can read vendor (Android or OrangeFox). Real Metal is the multi-year track in docs/METAL-PORT.md.
+Status 2026-11-19: this davinci branch includes Adreno 618 probe/power code,
+vendor a618 GMU firmware and SQE microcode, and a `sweetgpu=5` lab path for
+GMU/SQE/ring bring-up. The notes record lab-image boot attempts but no
+confirmed ring-idle result or GPU-rendered iOS frame. The current successful
+Hello-screen test is CPU-rendered (`sweetgpu` default probe mode); it does not
+use the GPU. The persistent log identifies `Adreno 618 (davinci/sweet)` but
+reports CX/GX gated and skips GPU MMIO in mode 1. The next controlled
+hardware step is `sweetgpu=2` (power CX and read the chip ID), not enabling
+the IOKit accelerator or expecting iOS rendering. Real, unmodified iOS Metal
+remains blocked on the AGX-to-a6xx shader-translation problem described
+above. See `docs/METAL-PORT.md`.
 
 ### Boot-arg `sweetgpu`
 

@@ -126,6 +126,9 @@
   synchronously waiting on `__LSCopyServerStore`. This narrows the startup
   dependency chain but does not yet identify the underlying database or
   MobileGestalt failure.
+- The same recovered log reports `SWEET GPU: Adreno 618 (davinci/sweet) mode 1`,
+  but CX/GX are gated; the read-only default probe therefore skips GPU MMIO.
+  No GPU power-up, command submission, or rendering was tested in this boot.
 - The temporary LaunchServices sampler image
   `/mnt/wrk/davinci-ios-ls-sample-boot.img` (SHA-256
   `f4f491f12ef600d4668016671f1da45aba4c4b7dca5511b525276290d86a5a32`).
@@ -156,8 +159,11 @@
   unpacked and verified: kernel and DTB are byte-identical to the current
   diagnostic image, and all other payload boot arguments are retained. On
   2026-11-19 it was temporarily booted from fastboot (`Sending` and `Booting`
-  both `OKAY`); no partition was written. Awaiting the user's touchscreen
-  test after the driver has had time to initialize.
+  both `OKAY`); no partition was written. The user confirms touch now responds
+  after a 2-3 second delay, but a swipe is incomplete and Setup Assistant
+  returns to Hello. This image still uses `cpus=1` and leaves
+  `sweetgpu` at its default read-only probe mode; neither GPU power-up nor
+  GPU rendering was tested.
 - Do not commit the user-supplied firmware/boot image or generated root image.
   If another persistent write is considered, obtain fresh explicit
   confirmation immediately before it. Keep bootloaders, recovery, modem,
