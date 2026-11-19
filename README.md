@@ -25,9 +25,11 @@ This is experimental bring-up work, not a daily-use operating system.
 - Wi-Fi, cellular, audio, camera, sensors, SEP/Face ID, and a working GPU
   remain unavailable or experimental. The inherited port disables or stubs
   parts of iOS security; do not use personal accounts or data.
-- The current touch test uses `cpus=1` and leaves `sweetgpu` in its default
-  read-only probe mode. GPU driver bring-up is separate from accelerating
-  iOS CoreAnimation; see [docs/GPU.md](docs/GPU.md).
+- The current test uses `cpus=1`. A `sweetgpu=2` boot only attempts CX power
+  and chip-ID access; the user reports no change in UI lag, as expected
+  without GPU rendering. The mode-2 log has not yet been checked. GPU
+  driver bring-up is separate from accelerating iOS CoreAnimation; see
+  [docs/GPU.md](docs/GPU.md).
 
 The Mi 9T's 1080x2340 display and GT9886 touchscreen are distinct from the
 Redmi Note 10 Pro's 1080x2400 display and GT9896 touchscreen. Davinci uses an

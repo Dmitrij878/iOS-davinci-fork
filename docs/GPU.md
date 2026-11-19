@@ -300,12 +300,14 @@ GMU/SQE/ring bring-up. The notes record lab-image boot attempts but no
 confirmed ring-idle result or GPU-rendered iOS frame. The current successful
 Hello-screen test is CPU-rendered (`sweetgpu` default probe mode); it does not
 use the GPU. The persistent log identifies `Adreno 618 (davinci/sweet)` but
-reports CX/GX gated and skips GPU MMIO in mode 1. The next controlled
+reports CX/GX gated and skips GPU MMIO in mode 1. The first controlled
 hardware step is `sweetgpu=2` (power CX and read the chip ID), not enabling
 the IOKit accelerator or expecting iOS rendering. This mode-2 image was
-temporarily booted on 2026-11-19; fastboot accepted it, but GPU initialization
-is not yet confirmed from the persistent log. Real, unmodified iOS Metal
-remains blocked on the AGX-to-a6xx shader-translation problem described
+temporarily booted on 2026-11-19. The user reports the Hello screen appears
+but UI lag is unchanged; this is expected because mode 2 only attempts CX
+power and chip-ID access, and does not render iOS. The persistent log has not
+been pulled, so GPU initialization remains unconfirmed. Real, unmodified iOS
+Metal remains blocked on the AGX-to-a6xx shader-translation problem described
 above. See `docs/METAL-PORT.md`.
 
 ### Boot-arg `sweetgpu`

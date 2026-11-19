@@ -137,8 +137,12 @@
   active GPU test: CX power/clocks and chip-ID read only; it is not a renderer
   or a performance fix. On 2026-11-19 the user authorized a temporary boot
   from fastboot; `Sending` and `Booting` both returned `OKAY`, and no
-  partition was written. Awaiting screen feedback and a later persistent-log
-  pull; bootloader acceptance alone does not confirm GPU initialization.
+  partition was written. The user reports the image reaches Hello but feels
+  just as laggy. This is expected because mode 2 does not submit GPU work or
+  render iOS; bootloader acceptance alone does not confirm GPU initialization.
+  The mode-2 persistent log has not yet been pulled, so the chip ID and power
+  result remain unverified. The user also reports wired data transfer is not
+  working from the running iOS environment.
 - The temporary LaunchServices sampler image
   `/mnt/wrk/davinci-ios-ls-sample-boot.img` (SHA-256
   `f4f491f12ef600d4668016671f1da45aba4c4b7dca5511b525276290d86a5a32`).
