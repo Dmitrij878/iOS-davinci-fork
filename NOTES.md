@@ -1,5 +1,26 @@
 # iOS 16 XNU port (shared SWEET baseline, DAVINCI target) - working notes
 
+## Agent handoff / DAVINCI USB logging and DPU 0104 (2026-11-21)
+
+- User confirmed that the davinci USB test with `sweetusb=2` brought up
+  DWC3 at `0xa600000` and the `ue0` interface. The host received live kernel
+  console logs over UDP port 5140. The framebuffer reported
+  `SWEET FB: present ... every 166ms (flips 0)` on the CPU-copy path.
+- Built `/mnt/wrk/davinci-ios-dpu0104-boot.img` from
+  `/mnt/wrk/davinci-ios-usbnet-boot.img`.
+  Changed `sweetfb_flip=0` to `sweetfb_flip=1` and added
+  `sweetdpu=2 sweetfb_probe=2 sweetfb_chart=8`. The image retains
+  `sweetusb=2 cpus=6 davinci_touch_probeonly=0` and the other source arguments.
+  Verified byte-for-byte that only the XNU argument field and Android boot
+  header ID changed. The image is 17,264,640 bytes, SHA-256
+  `e284e12fd5d49387f233b1a7ff05d07fe51677ffd3cd73191e8c379bd9bb3b31`.
+  Built locally from the USB milestone image, with no new kernel or CI run.
+- Next boot test: temporarily boot the 0104 image, check the panel for the
+  color chart, and compare the boot-time SSPP register dump against
+  `SWEET DPU: after flip sspp+...` over UDP 5140. The latter runs
+  automatically after the first successful DPU flip. The diagnostic image
+  has yet to be booted.
+
 ## Agent handoff / DAVINCI work (2026-11-19)
 
 - Use the `gpu-bringup` source at `cd128b2`, not the older `main` branch.
