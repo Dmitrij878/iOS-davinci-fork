@@ -15,11 +15,49 @@
   header ID changed. The image is 17,264,640 bytes, SHA-256
   `e284e12fd5d49387f233b1a7ff05d07fe51677ffd3cd73191e8c379bd9bb3b31`.
   Built locally from the USB milestone image, with no new kernel or CI run.
-- Next boot test: temporarily boot the 0104 image, check the panel for the
-  color chart, and compare the boot-time SSPP register dump against
-  `SWEET DPU: after flip sspp+...` over UDP 5140. The latter runs
-  automatically after the first successful DPU flip. The diagnostic image
-  has yet to be booted.
+- The davinci 0104 test boot streamed its log over UDP 5140
+  (local capture `/tmp/dpu0104.log`). Surface 2 (1125x2436 BGRA, stride
+  4608) flipped at `0x9cc00000` with crop origin (22,48). The user saw
+  fine horizontal stripes and a vertical checkerboard stair-step near the
+  left edge during direct DPU scanout. Surface 3 had `phys 0x0` after the
+  686-page contiguous allocation failed, so its frames used the 9871 KiB
+  CPU crop-copy path. The earlier CPU-copy boot reached Home. The 0104 log
+  records the copy but supplies no separate visual observation for it.
+- The earlier davinci boot probe and 0104 post-flip dump agree on
+  `SRC_FORMAT=0x000237ff`, `UNPACK=0x03020001`, and `OP_MODE=0x80000000`.
+  The format has linear frame bits and BWC is off. `FETCH_CONFIG=0x87` is
+  the vendor reset value. `0x044` is UBWC static configuration and does
+  not enable compression. The post-flip `CDP_CNTL=0x0f` still enables
+  tiled amortization and UBWC metadata preload. Targeted DTB reads locate
+  QSEED3Lite at VIG+0xa00 and CSC10 at VIG+0x1a00, beyond the 0104 dump.
+  CTL0 flush bit 0 matches vendor SDE's VIG0 mapping. The first flip's
+  address and geometry read back, but register readback does not establish
+  which inherited setting caused the screen artifact.
+- Prepared `0105-davinci-linear-scanout.patch`. For the observed SM7150
+  single-rectangle VIG path, it programs linear BGRA8, linear-only CDP,
+  zero decimation and pixel extension taps, and a 1:1 scaler bypass with
+  CSC10 disabled. It logs the boot and post-flip values, including the
+  scaler and CSC controls, and restores the bootloader state for CPU copy.
+- The stock DTB and ADT put the splash at `0x9c000000..0x9d700000` (23 MiB),
+  with DFPS data immediately after it. The shim gives the panel at its base
+  to XNU as the default framebuffer. The slot at `0x9cc00000` fits the
+  11,239,424-byte surface, with no room for another beside it. The tested
+  `--highmem` ADT gives VM only addresses at or above 4 GiB, so 0101's
+  VM-backed below-4-GiB pool cannot supply another slot.
+- The 0105 highmem ADT advertises two 12 MiB scanout slots at `0xfb800000`
+  and `0xfc400000`, within the existing low-memory XNU boot window. XNU's
+  highmem VM excludes them and neither overlaps a fixed reservation in the
+  stock davinci DTB. IOSurface takes these slots before the splash fallback
+  and returns a slot when its surface is freed. The framebuffer holds a
+  retain on the active scanout surface.
+- Offline validation passed for the 0099–0105 patch chain, the ADT ranges,
+  and host mocks of slot checkout and reuse, two DPU flips, and register
+  restoration. A new XNU kernel build and a new payload with the highmem
+  ADT are required. No CI run or hardware boot of 0105 yet. First test with
+  `sweetfb_flip=1 sweetdpu=2 sweetfb_chart=8 sweetusb=2` and the existing
+  CPU and touch settings. Then measure sustained flip rate with the chart
+  disabled. Confirm the panel is clean and both surfaces flip before
+  reporting 60 FPS.
 
 ## Agent handoff / DAVINCI work (2026-11-19)
 

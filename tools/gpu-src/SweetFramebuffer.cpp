@@ -123,6 +123,7 @@ public:
 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
 	IOMemoryMap  *fMap;
 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+	SweetSurface *fScanout;         /* retained while the DPU uses this slot */
 	IOLock       *fLock;            /* swaps and client list */
 	OSArray      *fClients;
 	uint32_t      fSwapID;
@@ -212,30 +213,8 @@ AppleCLCD::start(IOService *provider)
 	 */
 	fCacheMode = 1;
 	PE_parse_boot_argn("sweetfb_cache", &fCacheMode, sizeof(fCacheMode));
-	/*
-	 * Splash pool: CA full-screen layers land in the ABL 24 MB carve-out the
-	 * DPU already scans. Flip defaults ON so present is SRC_ADDR, not memcpy.
-	 * sweetfb_flip=0 forces the CPU copy path again.
-	 */
-	{
-		/* Two ~12 MB slots in the 24 MB splash: fits 1125x2436 BGRA. */
-		sweet_surface_set_splash_pool(fPhys, 24u << 20, (24u << 20) / 2);
-		fFlipMode = 1;
-		PE_parse_boot_argn("sweetfb_flip", &fFlipMode, sizeof(fFlipMode));
-		/*
-		 * The carve-out only holds one CA surface, but CoreAnimation keeps
-		 * two or three in rotation; without contiguous slots for all of
-		 * them only every other frame could flip, and the frames that fell
-		 * back to a copy were invisible (the DPU was still scanning the
-		 * flipped surface).
-		 */
-		if (fFlipMode != 0) {
-			uint32_t slots = 3;
-
-			PE_parse_boot_argn("sweetfb_flipslots", &slots, sizeof(slots));
-			sweet_surface_flip_pool((24u << 20) / 2, slots);
-		}
-	}
+	fFlipMode = 1;
+	PE_parse_boot_argn("sweetfb_flip", &fFlipMode, sizeof(fFlipMode));
 	if (fCacheMode != 0 && fSurface != NULL) {
 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys,
 		    (vm_size_t)fRowBytes * fHeight, kIODirectionInOut);
@@ -279,8 +258,13 @@ AppleCLCD::start(IOService *provider)
 		IOLog("SWEET FB: no present timer\n");
 		return false;
 	}
+	uint32_t slots = 3;
+	PE_parse_boot_argn("sweetfb_flipslots", &slots, sizeof(slots));
+	sweet_surface_init_scanout(fPhys, (uint64_t)fRowBytes * fHeight,
+	    12u << 20, fFlipMode != 0 ? slots : 0);
+	/* Finish the hardware probe before a client can queue its first flip. */
+	sweet_display_probe(fPhys, fRowBytes, fWidth, fHeight);
 	fPresentTimer->setTimeoutUS(fPeriodUS);
-
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	setProperty("external", false);
 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
@@ -290,8 +274,6 @@ AppleCLCD::start(IOService *provider)
 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPeriodUS,
 	    fCacheMode != 0 ? "cached" : "write-combined",
 	    fFlipMode != 0 ? "on" : "off");
-	/* Discover the live SSPP; enables sweet_display_flip when found. */
-	sweet_display_probe(fPhys, fRowBytes, fWidth, fHeight);
 	if (fFlipMode != 0 && !sweet_display_can_flip()) {
 		IOLog("SWEET FB: sweetfb_flip=1 but DPU layer not found, CPU copy stays\n");
 	}
@@ -386,6 +368,7 @@ AppleCLCD::presentFired(OSObject *owner, IOTimerEventSource *sender)
 		/* Fade must hit the buffer the DPU is scanning. */
 		if (step == 0 && fb->fFlipMode != 0) {
 			sweet_display_flip_reset();
+			OSSafeReleaseNULL(fb->fScanout);
 		}
 		/* Fade out: halve every channel each step, then black, then idle. */
 		if (step <= 6) {
@@ -647,7 +630,7 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		lw = (int32_t)s->width;
 		lh = (int32_t)s->height;
 	}
-	if (sx < 0 || sy < 0 ||
+	if (sx < 0 || sy < 0 || s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->planeCount != 0 ||
 	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
 		s->release();
 		return false;
@@ -715,6 +698,8 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		s->release();
 		return false;
 	}
+	OSSafeReleaseNULL(fb->fScanout);
+	fb->fScanout = s;  /* Transfer the lookup retain. */
 	fb->fFlips++;
 	fb->fFrameBytes = 0;
 	if (flip_logged < 8) {
@@ -724,7 +709,6 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		    s->id, (unsigned long long)phys, crop_x, crop_y,
 		    s->bytesPerRow, fb->fWidth, fb->fHeight);
 	}
-	s->release();
 	return true;
 }
 
@@ -861,6 +845,7 @@ AppleCLCD::present(const uint8_t *rec)
 	 * Cheap no-op when the plane was never moved.
 	 */
 	sweet_display_flip_reset();
+	OSSafeReleaseNULL(fScanout);
 	if (sweet_fb_try_crop_copy(this, rec)) {
 		return;
 	}

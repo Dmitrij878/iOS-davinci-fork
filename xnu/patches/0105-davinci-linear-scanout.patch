@@ -1,0 +1,881 @@
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -35,6 +35,7 @@
+ 	uint32_t cacheMode, planeCount, parentID;
+ 	uint64_t physAddr;      /* first byte PA if contiguous & known, else 0 */
+ 	uint32_t poolIdx;       /* flip-pool slot backing this surface, or ~0 */
++	uint32_t splashIdx;     /* splash slot backing this surface, or 0 */
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
+ 
+ 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
+@@ -57,25 +58,9 @@
+  */
+ uint64_t sweet_surface_phys(SweetSurface *s);
+ 
+-/*
+- * Carve the ABL splash region (disp_rdump_region, typically 24 MB at
+- * 0x9c000000) into slots the DPU can already scan. Full-screen IOSurfaces
+- * are allocated from those slots so CoreAnimation draws into memory the
+- * display controller can flip to - no expensive contiguous DRAM alloc.
+- * Slot 0 is the live panel (owned by AppleCLCD); CA gets 1..N-1.
+- */
+-void sweet_surface_set_splash_pool(uint64_t phys, uint32_t region_bytes,
+-    uint32_t slot_bytes);
+-
+-/*
+- * Reserve count physically contiguous, 32-bit-addressable buffers of slot_bytes
+- * for full-screen layers. The ABL carve-out holds a single CA-sized slot, so a
+- * compositor that rotates two surfaces made only every other frame flippable
+- * (the DPU has no SMMU map, it cannot scan wired pages). These slots are
+- * handed out before the splash slot; returns how many were reserved, 0 leaves
+- * the old single-slot behaviour. Called once from AppleCLCD::start().
+- */
+-uint32_t sweet_surface_flip_pool(uint32_t slot_bytes, uint32_t count);
++/* Set up the splash and scanout slots before publishing the display. */
++void sweet_surface_init_scanout(uint64_t panel_pa, uint64_t panel_bytes,
++    uint32_t slot_bytes, uint32_t count);
+ 
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -38,6 +38,7 @@
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
++#include <pexpert/device_tree.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/proc.h>
+ 
+@@ -76,21 +77,24 @@
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+-/*
+- * Flip pool: physically contiguous buffers below 4 GB, so every full-screen
+- * layer CoreAnimation rotates through can be scanned out. The ABL carve-out
+- * is only large enough for one CA-sized slot; the second surface used to land
+- * on wired pages the DPU cannot address, so every other frame fell back to a
+- * CPU copy (and the panel froze on the flipped one).
+- */
++/* Scanout slots below 4 GiB. The reserved range is outside XNU's VM. */
+ #define SWEET_FLIP_SLOTS        4
+ static struct {
+-	IOBufferMemoryDescriptor *md;
+-	uint64_t                  pa;
++	IOMemoryDescriptor *md;
++	uint64_t            pa;
+ } g_flip[SWEET_FLIP_SLOTS];
+ static uint32_t g_flip_count;    /* slots reserved by sweet_surface_flip_pool */
+ static uint32_t g_flip_bytes;    /* size of one slot */
+ static uint32_t g_flip_used;     /* bit i = slot i handed to a surface */
++static bool g_flip_vm_alloc;
++
++#define SWEET_SPLASH_SLOTS      3
++static struct {
++	uint64_t phys;
++	uint32_t region;
++	uint32_t slot;
++	uint32_t used;
++} g_splash;
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+@@ -100,16 +104,19 @@
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+-	if (poolIdx < SWEET_FLIP_SLOTS && sweet_surface_lock != NULL) {
+-		/* Give the slot back: compositors recreate surfaces on mode
+-		 * changes and a leaked slot would silently cost a flip later. */
+-		IOLockLock(sweet_surface_lock);
+-		g_flip_used &= ~(1u << poolIdx);
+-		IOLockUnlock(sweet_surface_lock);
+-	}
+-	poolIdx = ~0u;
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
++	if (sweet_surface_lock != NULL &&
++	    (poolIdx < SWEET_FLIP_SLOTS || splashIdx != 0)) {
++		IOLockLock(sweet_surface_lock);
++		if (poolIdx < SWEET_FLIP_SLOTS) {
++			g_flip_used &= ~(1u << poolIdx);
++		}
++		if (splashIdx != 0) {
++			g_splash.used &= ~(1u << splashIdx);
++		}
++		IOLockUnlock(sweet_surface_lock);
++	}
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+ }
+@@ -226,8 +233,12 @@
+ {
+ 	sweet_surface_init_lock();
+ 	SweetSurface *s = OSTypeAlloc(SweetSurface);
+-	if (s == NULL || !s->init()) {
+-		OSSafeReleaseNULL(s);
++	if (s == NULL) {
++		return NULL;
++	}
++	s->poolIdx = ~0u;
++	if (!s->init()) {
++		s->release();
+ 		return NULL;
+ 	}
+ 	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+@@ -237,7 +248,6 @@
+ 		return NULL;
+ 	}
+ 	bzero(s->state->getBytesNoCopy(), page_size);
+-	s->poolIdx = ~0u;
+ 	return s;
+ }
+ 
+@@ -251,78 +261,92 @@
+ 	return ok;
+ }
+ 
+-#define SWEET_SPLASH_SLOTS      3
+-
+-static struct {
+-	uint64_t phys;
+-	uint32_t region;
+-	uint32_t slot;
+-	uint32_t used;          /* bit i = slot i taken (slot 0 = panel) */
+-	int      enabled;
+-} g_splash;
+-
+-void
++static void
+ sweet_surface_set_splash_pool(uint64_t phys, uint32_t region_bytes,
+     uint32_t slot_bytes)
+ {
+ 	int on = 1;
+ 
+ 	PE_parse_boot_argn("sweetfb_splash", &on, sizeof(on));
+-	g_splash.enabled = 0;
+-	g_splash.phys = 0;
+-	g_splash.region = 0;
+-	g_splash.slot = 0;
+-	g_splash.used = 0;
+-	if (on <= 0 || phys == 0 || region_bytes < slot_bytes * 2 || slot_bytes == 0) {
++	if (on <= 0 || phys == 0 || slot_bytes == 0 || region_bytes <= slot_bytes ||
++	    phys >= 0x100000000ull || region_bytes > 0x100000000ull - phys ||
++	    ((phys | region_bytes | slot_bytes) & (page_size - 1)) != 0) {
+ 		IOLog("SWEET SURF: splash pool off\n");
+ 		return;
+ 	}
+-	slot_bytes = (uint32_t)round_page(slot_bytes);
+-	if (slot_bytes * 2 > region_bytes) {
+-		IOLog("SWEET SURF: splash region too small for 2 slots\n");
+-		return;
+-	}
++	IOLockLock(sweet_surface_lock);
+ 	g_splash.phys = phys;
+ 	g_splash.region = region_bytes;
+ 	g_splash.slot = slot_bytes;
+-	g_splash.used = 1u;     /* slot 0 = panel framebuffer */
+-	g_splash.enabled = 1;
+-	IOLog("SWEET SURF: splash pool pa 0x%llx region %u slot %u (%u CA slots)\n",
+-	    (unsigned long long)phys, region_bytes, slot_bytes,
+-	    region_bytes / slot_bytes - 1);
+-}
+-
+-/*
+- * Reserve physically contiguous slot_bytes buffers below 4 GB. A single big
+- * request is more likely to succeed than a later one, and the pool has to be
+- * ready before CoreAnimation creates its surfaces, so this runs in start().
+- */
+-uint32_t
++	IOLockUnlock(sweet_surface_lock);
++	IOLog("SWEET SURF: splash pool pa 0x%llx region %u slot %u\n",
++	    (unsigned long long)phys, region_bytes, slot_bytes);
++}
++
++/* Read a pair of 64-bit ADT cells without assuming 8-byte property alignment. */
++static bool
++sweet_surface_dt_range(const char *path, const char *key, uint64_t (&range)[2])
++{
++	DTEntry node;
++	const void *value;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, path, &node) != kSuccess ||
++	    SecureDTGetProperty(node, key, &value, &size) != kSuccess ||
++	    size != sizeof(range)) {
++		return false;
++	}
++	memcpy(range, value, sizeof(range));
++	return true;
++}
++
++static void
+ sweet_surface_flip_pool(uint32_t slot_bytes, uint32_t count)
+ {
+-	int flip = 0;
+-
+-	if (g_flip_count != 0 || slot_bytes == 0 || count == 0) {
+-		return g_flip_count;
+-	}
+-	PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
+-	if (flip <= 0) {
+-		IOLog("SWEET SURF: flip pool off (sweetfb_flip=0)\n");
+-		return 0;
++	DTEntry chosen;
++	const void *value;
++	unsigned int size;
++	uint64_t dram_base = 0;
++	uint64_t reserved[2] = {};
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++	    SecureDTGetProperty(chosen, "dram-base", &value, &size) == kSuccess &&
++	    size == sizeof(dram_base)) {
++		memcpy(&dram_base, value, sizeof(dram_base));
++	}
++	const bool highmem = dram_base >= 0x100000000ull;
++	if (highmem) {
++		if (!sweet_surface_dt_range("/arm-io/disp0", "scanout-reg", reserved) ||
++		    reserved[0] < 0xb0000000ull || reserved[0] >= 0xfd000000ull ||
++		    reserved[1] > 0xfd000000ull - reserved[0] ||
++		    (reserved[0] & (page_size - 1)) != 0) {
++			IOLog("SWEET SURF: highmem without a valid scanout-reg\n");
++			return;
++		}
++		if (count > reserved[1] / slot_bytes) {
++			count = (uint32_t)(reserved[1] / slot_bytes);
++		}
+ 	}
+ 	if (count > SWEET_FLIP_SLOTS) {
+ 		count = SWEET_FLIP_SLOTS;
+ 	}
+-	slot_bytes = (uint32_t)round_page(slot_bytes);
++	IOLockLock(sweet_surface_lock);
++	g_flip_vm_alloc = !highmem;
+ 	for (uint32_t i = 0; i < count; i++) {
+-		IOBufferMemoryDescriptor *md =
+-		    IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-		    kIODirectionInOut | kIOMemoryKernelUserShared |
+-		    kIOMemoryPhysicallyContiguous, slot_bytes, 0x00000000ffffffffull);
+ 		IOByteCount len = 0;
+-		addr64_t pa = md != NULL ? md->getPhysicalSegment(0, &len) : 0;
+-
+-		if (md == NULL || pa == 0 || len < slot_bytes ||
++		IOMemoryDescriptor *md;
++		addr64_t pa;
++		if (highmem) {
++			pa = reserved[0] + (uint64_t)i * slot_bytes;
++			md = NULL;  /* Make a descriptor of exactly allocSize at checkout. */
++			len = slot_bytes;
++		} else {
++			md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++			    kIODirectionInOut | kIOMemoryKernelUserShared |
++			    kIOMemoryPhysicallyContiguous, slot_bytes, 0x00000000ffffffffull);
++			pa = md != NULL ? md->getPhysicalSegment(0, &len) : 0;
++		}
++
++		if ((!highmem && md == NULL) || pa == 0 || len < slot_bytes ||
+ 		    pa > 0xffffffffull || pa + slot_bytes > 0x100000000ull) {
+ 			IOLog("SWEET SURF: flip pool slot %u of %u bytes: %s\n", i,
+ 			    slot_bytes, md == NULL ? "contiguous alloc failed" :
+@@ -333,14 +357,29 @@
+ 		g_flip[i].md = md;
+ 		g_flip[i].pa = pa;
+ 		g_flip_count++;
+-		IOLog("SWEET SURF: flip pool %u pa 0x%llx %u bytes\n", i,
+-		    (unsigned long long)pa, slot_bytes);
++		IOLog("SWEET SURF: flip pool %u pa 0x%llx %u bytes (%s)\n", i,
++		    (unsigned long long)pa, slot_bytes, highmem ? "reserved" : "wired");
+ 	}
+ 	g_flip_bytes = slot_bytes;
+-	IOLog("SWEET SURF: flip pool %u slots of %u bytes (%u KB wired) -> "
+-	    "%s\n", g_flip_count, slot_bytes, (g_flip_count * slot_bytes) / 1024u,
+-	    g_flip_count != 0 ? "every CA layer can flip" : "splash slot only");
+-	return g_flip_count;
++	IOLockUnlock(sweet_surface_lock);
++}
++
++void
++sweet_surface_init_scanout(uint64_t panel_pa, uint64_t panel_bytes,
++    uint32_t slot_bytes, uint32_t count)
++{
++	uint64_t splash[2];
++	if (slot_bytes == 0 || (slot_bytes & (page_size - 1)) != 0) {
++		return;
++	}
++	if (sweet_surface_dt_range("/sweet-fbcon", "reg", splash) &&
++	    splash[0] == panel_pa && splash[1] <= UINT32_MAX &&
++	    panel_bytes <= slot_bytes) {
++		sweet_surface_set_splash_pool(panel_pa, (uint32_t)splash[1], slot_bytes);
++	}
++	if (count != 0) {
++		sweet_surface_flip_pool(slot_bytes, count);
++	}
+ }
+ 
+ static bool
+@@ -349,7 +388,8 @@
+ 	if (s == NULL) {
+ 		return false;
+ 	}
+-	if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
++	if (s->pixelFormat != 0x42475241u || s->planeCount != 0 ||
++	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
+ 		return false;
+ 	}
+ 	if (s->width < 720 || s->height < 1280 || s->allocSize < (2u << 20)) {
+@@ -358,63 +398,50 @@
+ 	return true;
+ }
+ 
+-/*
+- * Prefer a splash slot (DPU already scans this RAM). Falls back to contiguous
+- * DRAM only when sweetfb_flip=1 and splash is exhausted/off.
+- */
+ static bool
+ sweet_surface_want_contig(SweetSurface *s)
+ {
+-	static int flip = -1;
+-
+-	if (flip < 0) {
+-		flip = 0;
+-		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
+-	}
+-	return flip > 0 && sweet_surface_is_display_layer(s);
++	IOLockLock(sweet_surface_lock);
++	bool enabled = g_flip_vm_alloc;
++	IOLockUnlock(sweet_surface_lock);
++	return enabled && sweet_surface_is_display_layer(s);
+ }
+ 
+ static IOMemoryDescriptor *
+ sweet_surface_splash_alloc(SweetSurface *s, uint64_t *out_pa)
+ {
+-	uint32_t i, n;
+-	uint64_t pa;
+-
+ 	*out_pa = 0;
+-	if (!g_splash.enabled || !sweet_surface_is_display_layer(s)) {
++	if (!sweet_surface_is_display_layer(s)) {
+ 		return NULL;
+ 	}
+-	if (s->allocSize > g_splash.slot) {
+-		return NULL;
+-	}
+-	n = g_splash.region / g_splash.slot;
+-	if (n > SWEET_SPLASH_SLOTS) {
+-		n = SWEET_SPLASH_SLOTS;
+-	}
+-	for (i = 1; i < n; i++) {
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t i = 1; g_splash.slot != 0 && i < SWEET_SPLASH_SLOTS; i++) {
++		uint64_t offset = (uint64_t)i * g_splash.slot;
++		if (offset + s->allocSize > g_splash.region || s->allocSize > g_splash.slot) {
++			break;
++		}
+ 		if (g_splash.used & (1u << i)) {
+ 			continue;
+ 		}
+-		pa = g_splash.phys + (uint64_t)i * g_splash.slot;
++		uint64_t pa = g_splash.phys + offset;
+ 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa,
+ 		    s->allocSize, kIODirectionInOut);
+ 		if (md == NULL) {
+-			return NULL;
++			break;
+ 		}
+ 		g_splash.used |= (1u << i);
++		s->splashIdx = i;
+ 		*out_pa = pa;
++		IOLockUnlock(sweet_surface_lock);
+ 		IOLog("SWEET SURF: splash slot %u pa 0x%llx size %u\n",
+ 		    i, (unsigned long long)pa, s->allocSize);
+ 		return md;
+ 	}
++	IOLockUnlock(sweet_surface_lock);
+ 	return NULL;
+ }
+ 
+-/*
+- * A reserved flip-pool slot for a full-screen layer, or NULL. Preferred over
+- * the splash slot: it is the only way to keep every surface of a rotating
+- * compositor flippable.
+- */
++/* Preferred over splash slots, with a descriptor scoped to the requested size. */
+ static IOMemoryDescriptor *
+ sweet_surface_pool_alloc(SweetSurface *s, uint64_t *out_pa, uint32_t *out_idx)
+ {
+@@ -422,23 +449,31 @@
+ 
+ 	*out_pa = 0;
+ 	*out_idx = ~0u;
+-	if (g_flip_count == 0 || !sweet_surface_is_display_layer(s) ||
+-	    s->allocSize > g_flip_bytes) {
++	if (!sweet_surface_is_display_layer(s)) {
+ 		return NULL;
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+-	for (i = 0; i < g_flip_count; i++) {
++	for (i = 0; i < g_flip_count && s->allocSize <= g_flip_bytes; i++) {
+ 		if (g_flip_used & (1u << i)) {
+ 			continue;
+ 		}
++		IOMemoryDescriptor *md = g_flip[i].md;
++		if (md != NULL) {
++			md->retain();  /* held by the pool and the surface */
++		} else {
++			md = IOMemoryDescriptor::withPhysicalAddress(g_flip[i].pa,
++			    s->allocSize, kIODirectionInOut);
++			if (md == NULL) {
++				break;
++			}
++		}
+ 		g_flip_used |= 1u << i;
+-		g_flip[i].md->retain();        /* held by the pool and the surface */
+ 		*out_pa = g_flip[i].pa;
+ 		*out_idx = i;
+ 		IOLockUnlock(sweet_surface_lock);
+ 		IOLog("SWEET SURF: flip slot %u pa 0x%llx size %u\n", i,
+ 		    (unsigned long long)*out_pa, s->allocSize);
+-		return g_flip[i].md;
++		return md;
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return NULL;
+@@ -941,41 +976,37 @@
+ 		uint64_t splash_pa = 0;
+ 		uint64_t pool_pa = 0;
+ 		uint32_t pool_idx = ~0u;
+-		bool splash = false;
+ 
+ 		/*
+ 		 * Full-screen layers: a reserved flip-pool slot first, then the ABL
+-		 * splash carve-out the DPU already scans, then wired pages. Only the
+-		 * first two are addressable by the display controller, so how many
+-		 * layers can flip is decided here.
++		 * splash carve-out, then an ordinary IOSurface allocation.
+ 		 */
+ 		mem = sweet_surface_pool_alloc(s, &pool_pa, &pool_idx);
+ 		if (mem != NULL) {
+ 			s->poolIdx = pool_idx;
+ 			s->physAddr = pool_pa;
+-			s->mapCache = kIOMapDefaultCache;
+-			OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++			if (OSDynamicCast(IOBufferMemoryDescriptor, mem) != NULL) {
++				OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++			}
+ 		} else if ((mem = sweet_surface_splash_alloc(s, &splash_pa)) != NULL) {
+-			splash = true;
+ 			s->physAddr = splash_pa;
+-			s->mapCache = kIOMapCopybackCache;
+ 			/* Splash RAM is not charged to the wired budget. */
+-		} else if ((uint64_t)OSAddAtomic64(s->allocSize,
+-		    (volatile SInt64 *)&sweet_surface_wired) + s->allocSize <=
+-		    SWEET_SURFACE_WIRED_MAX) {
+-			IOBufferMemoryDescriptor *buf = NULL;
+-			if (sweet_surface_want_contig(s)) {
+-				buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-				    kIODirectionInOut | kIOMemoryKernelUserShared |
+-				    kIOMemoryPhysicallyContiguous,
+-				    s->allocSize, 0x00000000ffffffffull);
++		} else {
++			uint64_t wired = (uint64_t)OSAddAtomic64(s->allocSize,
++			    (volatile SInt64 *)&sweet_surface_wired) + s->allocSize;
++			if (wired <= SWEET_SURFACE_WIRED_MAX) {
++				if (sweet_surface_want_contig(s)) {
++					mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++					    kIODirectionInOut | kIOMemoryKernelUserShared |
++					    kIOMemoryPhysicallyContiguous,
++					    s->allocSize, 0x00000000ffffffffull);
++				}
++				if (mem == NULL) {
++					mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++					    kIODirectionInOut | kIOMemoryKernelUserShared,
++					    s->allocSize, page_size);
++				}
+ 			}
+-			if (buf == NULL) {
+-				buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-				    kIODirectionInOut | kIOMemoryKernelUserShared,
+-				    s->allocSize, page_size);
+-			}
+-			mem = buf;
+ 			if (mem == NULL) {
+ 				OSAddAtomic64(-(SInt64)s->allocSize,
+ 				    (volatile SInt64 *)&sweet_surface_wired);
+@@ -984,21 +1015,19 @@
+ 		if (mem == NULL) {
+ 			ret = kIOReturnNoMemory;
+ 		} else {
+-			if (!splash) {
+-				IOBufferMemoryDescriptor *buf =
+-				    OSDynamicCast(IOBufferMemoryDescriptor, mem);
+-				if (buf != NULL) {
+-					bzero(buf->getBytesNoCopy(), s->allocSize);
+-				}
+-				s->mapCache = kIOMapDefaultCache;
++			s->memory = mem;
++			IOBufferMemoryDescriptor *buf = OSDynamicCast(IOBufferMemoryDescriptor, mem);
++			s->mapCache = buf != NULL ? kIOMapDefaultCache : kIOMapCopybackCache;
++			uintptr_t pixels = s->kernelAddress();
++			if (pixels != 0) {
++				bzero((void *)pixels, s->allocSize);
+ 			}
+-			s->memory = mem;
+-			if (!splash && pool_idx == ~0u && sweet_surface_want_contig(s)) {
+-				/* Pool slots already carry the PA we allocated them at; only
+-				 * a fresh contiguous buffer needs to be interrogated. */
++			if (buf != NULL && pool_idx == ~0u && sweet_surface_want_contig(s)) {
+ 				sweet_surface_capture_phys(s);
+ 			}
+-			if (!sweet_surface_publish(s)) {
++			if (pixels == 0) {
++				ret = kIOReturnVMError;
++			} else if (!sweet_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
+ 			}
+ 		}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -123,6 +123,7 @@
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
++	SweetSurface *fScanout;         /* retained while the DPU uses this slot */
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+@@ -212,30 +213,8 @@
+ 	 */
+ 	fCacheMode = 1;
+ 	PE_parse_boot_argn("sweetfb_cache", &fCacheMode, sizeof(fCacheMode));
+-	/*
+-	 * Splash pool: CA full-screen layers land in the ABL 24 MB carve-out the
+-	 * DPU already scans. Flip defaults ON so present is SRC_ADDR, not memcpy.
+-	 * sweetfb_flip=0 forces the CPU copy path again.
+-	 */
+-	{
+-		/* Two ~12 MB slots in the 24 MB splash: fits 1125x2436 BGRA. */
+-		sweet_surface_set_splash_pool(fPhys, 24u << 20, (24u << 20) / 2);
+-		fFlipMode = 1;
+-		PE_parse_boot_argn("sweetfb_flip", &fFlipMode, sizeof(fFlipMode));
+-		/*
+-		 * The carve-out only holds one CA surface, but CoreAnimation keeps
+-		 * two or three in rotation; without contiguous slots for all of
+-		 * them only every other frame could flip, and the frames that fell
+-		 * back to a copy were invisible (the DPU was still scanning the
+-		 * flipped surface).
+-		 */
+-		if (fFlipMode != 0) {
+-			uint32_t slots = 3;
+-
+-			PE_parse_boot_argn("sweetfb_flipslots", &slots, sizeof(slots));
+-			sweet_surface_flip_pool((24u << 20) / 2, slots);
+-		}
+-	}
++	fFlipMode = 1;
++	PE_parse_boot_argn("sweetfb_flip", &fFlipMode, sizeof(fFlipMode));
+ 	if (fCacheMode != 0 && fSurface != NULL) {
+ 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys,
+ 		    (vm_size_t)fRowBytes * fHeight, kIODirectionInOut);
+@@ -279,8 +258,13 @@
+ 		IOLog("SWEET FB: no present timer\n");
+ 		return false;
+ 	}
++	uint32_t slots = 3;
++	PE_parse_boot_argn("sweetfb_flipslots", &slots, sizeof(slots));
++	sweet_surface_init_scanout(fPhys, (uint64_t)fRowBytes * fHeight,
++	    12u << 20, fFlipMode != 0 ? slots : 0);
++	/* Finish the hardware probe before a client can queue its first flip. */
++	sweet_display_probe(fPhys, fRowBytes, fWidth, fHeight);
+ 	fPresentTimer->setTimeoutUS(fPeriodUS);
+-
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+@@ -290,8 +274,6 @@
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPeriodUS,
+ 	    fCacheMode != 0 ? "cached" : "write-combined",
+ 	    fFlipMode != 0 ? "on" : "off");
+-	/* Discover the live SSPP; enables sweet_display_flip when found. */
+-	sweet_display_probe(fPhys, fRowBytes, fWidth, fHeight);
+ 	if (fFlipMode != 0 && !sweet_display_can_flip()) {
+ 		IOLog("SWEET FB: sweetfb_flip=1 but DPU layer not found, CPU copy stays\n");
+ 	}
+@@ -386,6 +368,7 @@
+ 		/* Fade must hit the buffer the DPU is scanning. */
+ 		if (step == 0 && fb->fFlipMode != 0) {
+ 			sweet_display_flip_reset();
++			OSSafeReleaseNULL(fb->fScanout);
+ 		}
+ 		/* Fade out: halve every channel each step, then black, then idle. */
+ 		if (step <= 6) {
+@@ -647,7 +630,7 @@
+ 		lw = (int32_t)s->width;
+ 		lh = (int32_t)s->height;
+ 	}
+-	if (sx < 0 || sy < 0 ||
++	if (sx < 0 || sy < 0 || s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->planeCount != 0 ||
+ 	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
+ 		s->release();
+ 		return false;
+@@ -715,6 +698,8 @@
+ 		s->release();
+ 		return false;
+ 	}
++	OSSafeReleaseNULL(fb->fScanout);
++	fb->fScanout = s;  /* Transfer the lookup retain. */
+ 	fb->fFlips++;
+ 	fb->fFrameBytes = 0;
+ 	if (flip_logged < 8) {
+@@ -724,7 +709,6 @@
+ 		    s->id, (unsigned long long)phys, crop_x, crop_y,
+ 		    s->bytesPerRow, fb->fWidth, fb->fHeight);
+ 	}
+-	s->release();
+ 	return true;
+ }
+ 
+@@ -861,6 +845,7 @@
+ 	 * Cheap no-op when the plane was never moved.
+ 	 */
+ 	sweet_display_flip_reset();
++	OSSafeReleaseNULL(fScanout);
+ 	if (sweet_fb_try_crop_copy(this, rec)) {
+ 		return;
+ 	}
+--- a/iokit/Kernel/arm/SweetDisplay.h
++++ b/iokit/Kernel/arm/SweetDisplay.h
+@@ -37,9 +37,9 @@
+  *
+  * The window is programmed, not inherited: SRC_SIZE and OUT_SIZE get the
+  * panel rect (each only when the register differs) and SRC_XY the crop origin,
+- * from the CAF SSPP offsets used by the probe. Format, unpack pattern and the
+- * mixer are left alone. SRC_ADDR is always written; every live CTL is then
+- * flushed and kicked, and SRC_ADDR/OUT_SIZE are read back.
++ * from the CAF SSPP offsets used by the probe. SM7150 VIG gets explicit
++ * linear BGRA8 fetch and 1:1 scaling state. SRC_ADDR is written and read
++ * back after flushing the live CTLs.
+  * Returns false if the probe did not find a layer, the DPU mapping is gone, or
+  * the write did not latch (the plane is restored and the flip disabled).
+  */
+--- a/iokit/Kernel/arm/SweetDisplay.cpp
++++ b/iokit/Kernel/arm/SweetDisplay.cpp
+@@ -49,7 +49,16 @@
+ #define SSPP_SRC_FORMAT     0x030u
+ #define SSPP_SRC_UNPACK     0x034u
+ #define SSPP_SRC_OP_MODE    0x038u
++#define SSPP_FETCH_CONFIG   0x048u
++#define SSPP_DECIMATION     0x0b4u
++#define SSPP_PIX_EXT_C0     0x100u
++#define SSPP_PIX_EXT_C1C2   0x110u
++#define SSPP_PIX_EXT_C3     0x120u
++#define SSPP_CDP_CNTL       0x134u
+ #define SSPP_MULTIRECT_MODE 0x170u
++#define VIG_QSEED3_OP_MODE  0xa04u
++#define VIG_CSC10_OP_MODE   0x1a00u
++#define SDE_REV_SM7150      0x50020000u
+ #define CTL_FLUSH           0x018u
+ #define CTL_START           0x01Cu
+ #define CTL_LAYER           0x000u
+@@ -106,6 +115,33 @@
+ 
+ #define SWEET_DPU_LIVE_WORDS    64
+ 
++/* SM7150 VIG, single-plane linear BGRA8, one source pixel per output pixel.
++ * Offsets follow the vendor SDE driver and davinci's VIG sub-block offsets.
++ * Pixel extension requests the existing panel width/height with no taps.
++ */
++static const struct {
++	uint32_t off;
++	uint32_t value;
++} kLinearVig[] = {
++	{ SSPP_SRC_FORMAT,       0x000237ffu },
++	{ SSPP_SRC_UNPACK,       0x03020001u },
++	{ SSPP_SRC_OP_MODE,      1u << 31 }, /* software pixel extension only */
++	{ SSPP_FETCH_CONFIG,     0x87u },
++	{ SSPP_DECIMATION,       0 },
++	{ SSPP_PIX_EXT_C0,       0 },
++	{ SSPP_PIX_EXT_C0 + 4,   0 },
++	{ SSPP_PIX_EXT_C0 + 8,   0 },
++	{ SSPP_PIX_EXT_C1C2,     0 },
++	{ SSPP_PIX_EXT_C1C2 + 4, 0 },
++	{ SSPP_PIX_EXT_C1C2 + 8, 0 },
++	{ SSPP_PIX_EXT_C3,       0 },
++	{ SSPP_PIX_EXT_C3 + 4,   0 },
++	{ SSPP_PIX_EXT_C3 + 8,   0 },
++	{ SSPP_CDP_CNTL,         0x9u }, /* linear preload, no UBWC metadata/tile amortization */
++	{ VIG_QSEED3_OP_MODE,    (1u << 14) | (1u << 10) }, /* 8-bit BGRA, scaler off */
++	{ VIG_CSC10_OP_MODE,     0 }, /* no YUV conversion */
++};
++
+ struct sweet_dpu_state {
+ 	vm_offset_t mdss;
+ 	uint32_t    sspp_off;
+@@ -119,7 +155,7 @@
+ 	uint32_t    ctl_bits;       /* bit i = ctl i carries a live LAYER */
+ 	uint32_t    flush_mask;
+ 	uint32_t    orig_pa;
+-	uint32_t    orig_stride;
++	uint32_t    orig_ystride;
+ 	uint32_t    orig_src_size;
+ 	uint32_t    orig_out_size;
+ 	uint32_t    orig_src_xy;
+@@ -129,6 +165,8 @@
+ 	uint32_t    cur_x, cur_y;    /* source window origin */
+ 	uint32_t    cur_w, cur_h;    /* source window size (= panel) */
+ 	uint32_t    flips_logged;
++	uint32_t    panel_w, panel_h;
++	uint32_t    orig_vig[sizeof(kLinearVig) / sizeof(kLinearVig[0])];
+ 	int         size_enc;       /* index into kSizeEnc, 0 = unknown */
+ 	int         geom_guess;     /* size packing could not be decoded */
+ 	int         geom_write;     /* sweetfb_geom, default on */
+@@ -136,6 +174,7 @@
+ 	int         video_mode;     /* INTF/PP counters moved */
+ 	int         ready;
+ 	int         disabled;       /* a flip failed to latch, stay on CPU copy */
++	bool        linear_vig;
+ 	const char *sspp_name;
+ };
+ 
+@@ -267,13 +306,6 @@
+ 		} else if (v == fb_stride || (v & 0xffffu) == fb_stride) {
+ 			IOLog("SWEET DPU: %s+0x%03x is the panel stride\n",
+ 			    b->name, off);
+-			if (b->flush != 0) {
+-				g_dpu.orig_stride = fb_stride;
+-				g_dpu.cur_stride = fb_stride;
+-				if (g_dpu.sspp_off == b->off) {
+-					g_dpu.src_stride_off = b->off + off;
+-				}
+-			}
+ 		}
+ 	}
+ }
+@@ -363,8 +395,8 @@
+ 	g_dpu_verbose = mode;
+ 
+ 	bzero(&g_dpu, sizeof(g_dpu));
+-	g_dpu.orig_stride = fb_stride;
+-	g_dpu.cur_stride = fb_stride;
++	g_dpu.panel_w = fb_width;
++	g_dpu.panel_h = fb_height;
+ 
+ 	mdss = ml_io_map(MDSS_PA, MDSS_SIZE);
+ 	if (mdss == 0) {
+@@ -423,8 +455,21 @@
+ 		g_dpu.orig_src_size = src;
+ 		g_dpu.orig_out_size = out;
+ 		g_dpu.orig_src_xy = src_xy;
++		g_dpu.orig_ystride = dpu_rd(mdss, g_dpu.src_stride_off);
++		g_dpu.cur_stride = g_dpu.orig_ystride & 0xffffu;
+ 		PE_parse_boot_argn("sweetfb_geom", &geom, sizeof(geom));
+ 		g_dpu.geom_write = geom > 0;
++		g_dpu.linear_vig = dpu_rd(mdss, MDSS_SDE_OFF) == SDE_REV_SM7150 &&
++		    (g_dpu.sspp_off == 0x5000u || g_dpu.sspp_off == 0x7000u) &&
++		    g_dpu.src_addr_off == g_dpu.sspp_off + SSPP_SRC0_ADDR &&
++		    multi == 0 && g_dpu.geom_write;
++		if (g_dpu.linear_vig) {
++			for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
++				uint32_t off = kLinearVig[i].off;
++				g_dpu.orig_vig[i] = dpu_rd(mdss, g_dpu.sspp_off + off);
++				IOLog("SWEET DPU: boot sspp+0x%03x=0x%08x\n", off, g_dpu.orig_vig[i]);
++			}
++		}
+ 
+ 		for (int e = 1; e <= (int)SWEET_SIZE_ENCS; e++) {
+ 			dpu_size_decode(out, e, &dw, &dh);
+@@ -511,16 +556,19 @@
+ 	if (!g_dpu.ready || g_dpu.mdss == 0) {
+ 		return;
+ 	}
++	if (g_dpu.linear_vig) {
++		for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
++			dpu_wr(g_dpu.mdss, g_dpu.sspp_off + kLinearVig[i].off, g_dpu.orig_vig[i]);
++		}
++	}
+ 	dpu_wr(g_dpu.mdss, g_dpu.src_size_off, g_dpu.orig_src_size);
+ 	dpu_wr(g_dpu.mdss, g_dpu.out_size_off, g_dpu.orig_out_size);
+ 	dpu_wr(g_dpu.mdss, g_dpu.src_xy_off, g_dpu.orig_src_xy);
+-	dpu_wr(g_dpu.mdss, g_dpu.src_stride_off,
+-	    (dpu_rd(g_dpu.mdss, g_dpu.src_stride_off) & 0xffff0000u) |
+-	    (g_dpu.orig_stride & 0xffffu));
++	dpu_wr(g_dpu.mdss, g_dpu.src_stride_off, g_dpu.orig_ystride);
+ 	dpu_wr(g_dpu.mdss, g_dpu.src_addr_off, g_dpu.orig_pa);
+ 	dpu_commit();
+ 	g_dpu.cur_pa = g_dpu.orig_pa;
+-	g_dpu.cur_stride = g_dpu.orig_stride;
++	g_dpu.cur_stride = g_dpu.orig_ystride & 0xffffu;
+ 	g_dpu.cur_src_size = g_dpu.orig_src_size;
+ 	/* The origin the bootloader left, not 0: a later crop flip only writes
+ 	 * SRC_XY when it differs from this. */
+@@ -554,6 +602,26 @@
+ 	}
+ 	IOLog("SWEET DPU: after flip sspp+0x000..0x1ec, %u nonzero words\n",
+ 	    n);
++	if (g_dpu.linear_vig) {
++		for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
++			uint32_t off = kLinearVig[i].off;
++			IOLog("SWEET DPU: linear sspp+0x%03x 0x%08x -> 0x%08x\n",
++			    off, g_dpu.orig_vig[i], dpu_rd(g_dpu.mdss, g_dpu.sspp_off + off));
++		}
++	}
++}
++
++static uint32_t
++dpu_linear_vig_value(unsigned int i, uint32_t size)
++{
++	switch (kLinearVig[i].off) {
++	case SSPP_PIX_EXT_C0 + 8:
++	case SSPP_PIX_EXT_C1C2 + 8:
++	case SSPP_PIX_EXT_C3 + 8:
++		return size;
++	default:
++		return kLinearVig[i].value;
++	}
+ }
+ 
+ /*
+@@ -581,6 +649,11 @@
+ 	if (!sweet_display_can_flip() || phys == 0 || width == 0 || height == 0) {
+ 		return false;
+ 	}
++	if (g_dpu.linear_vig && (width != g_dpu.panel_w || height != g_dpu.panel_h)) {
++		return false;
++	}
++	const bool setup_linear = g_dpu.linear_vig && !g_dpu.dirty;
++	const uint32_t pixel_ext_size = (height << 16) | width;
+ 	if (g_dpu.cur_pa == phys && g_dpu.dirty &&
+ 	    g_dpu.cur_stride == stride && g_dpu.cur_x == x && g_dpu.cur_y == y &&
+ 	    g_dpu.cur_w == width && g_dpu.cur_h == height) {
+@@ -617,11 +690,31 @@
+ 		}
+ 		g_dpu.cur_stride = stride;
+ 	}
++	if (setup_linear) {
++		for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
++			dpu_wr(g_dpu.mdss, g_dpu.sspp_off + kLinearVig[i].off,
++			    dpu_linear_vig_value(i, pixel_ext_size));
++		}
++	}
+ 	dpu_wr(g_dpu.mdss, g_dpu.src_addr_off, phys);
+ 	dpu_commit();
+ 
+ 	latched = dpu_rd(g_dpu.mdss, g_dpu.src_addr_off);
+ 	out = dpu_rd(g_dpu.mdss, g_dpu.out_size_off);
++	if (setup_linear) {
++		for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
++			uint32_t off = kLinearVig[i].off;
++			uint32_t expected = dpu_linear_vig_value(i, pixel_ext_size);
++			uint32_t actual = dpu_rd(g_dpu.mdss, g_dpu.sspp_off + off);
++			if (actual != expected) {
++				IOLog("SWEET DPU: linear sspp+0x%03x readback 0x%08x expected 0x%08x\n",
++				    off, actual, expected);
++				dpu_restore();
++				g_dpu.disabled = 1;
++				return false;
++			}
++		}
++	}
+ 	if (latched != phys || (wrote_size &&
+ 	    out != dpu_size_pack(width, height, g_dpu.size_enc))) {
+ 		IOLog("SWEET DPU: flip did not stick (addr 0x%08x/0x%08x out "

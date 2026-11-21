@@ -35,6 +35,7 @@ public:
 	uint32_t cacheMode, planeCount, parentID;
 	uint64_t physAddr;      /* first byte PA if contiguous & known, else 0 */
 	uint32_t poolIdx;       /* flip-pool slot backing this surface, or ~0 */
+	uint32_t splashIdx;     /* splash slot backing this surface, or 0 */
 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
 
 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
@@ -57,25 +58,9 @@ public:
  */
 uint64_t sweet_surface_phys(SweetSurface *s);
 
-/*
- * Carve the ABL splash region (disp_rdump_region, typically 24 MB at
- * 0x9c000000) into slots the DPU can already scan. Full-screen IOSurfaces
- * are allocated from those slots so CoreAnimation draws into memory the
- * display controller can flip to - no expensive contiguous DRAM alloc.
- * Slot 0 is the live panel (owned by AppleCLCD); CA gets 1..N-1.
- */
-void sweet_surface_set_splash_pool(uint64_t phys, uint32_t region_bytes,
-    uint32_t slot_bytes);
-
-/*
- * Reserve count physically contiguous, 32-bit-addressable buffers of slot_bytes
- * for full-screen layers. The ABL carve-out holds a single CA-sized slot, so a
- * compositor that rotates two surfaces made only every other frame flippable
- * (the DPU has no SMMU map, it cannot scan wired pages). These slots are
- * handed out before the splash slot; returns how many were reserved, 0 leaves
- * the old single-slot behaviour. Called once from AppleCLCD::start().
- */
-uint32_t sweet_surface_flip_pool(uint32_t slot_bytes, uint32_t count);
+/* Set up the splash and scanout slots before publishing the display. */
+void sweet_surface_init_scanout(uint64_t panel_pa, uint64_t panel_bytes,
+    uint32_t slot_bytes, uint32_t count);
 
 /* Retained surface for an id, or NULL. */
 SweetSurface *sweet_surface_copy(uint32_t id);

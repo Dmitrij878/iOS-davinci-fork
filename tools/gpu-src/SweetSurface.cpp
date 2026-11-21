@@ -38,6 +38,7 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSUnserialize.h>
+#include <pexpert/device_tree.h>
 #include <pexpert/pexpert.h>
 #include <sys/proc.h>
 
@@ -76,21 +77,24 @@ static uint32_t      sweet_surface_creates_logged;
 static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
 #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
 
-/*
- * Flip pool: physically contiguous buffers below 4 GB, so every full-screen
- * layer CoreAnimation rotates through can be scanned out. The ABL carve-out
- * is only large enough for one CA-sized slot; the second surface used to land
- * on wired pages the DPU cannot address, so every other frame fell back to a
- * CPU copy (and the panel froze on the flipped one).
- */
+/* Scanout slots below 4 GiB. The reserved range is outside XNU's VM. */
 #define SWEET_FLIP_SLOTS        4
 static struct {
-	IOBufferMemoryDescriptor *md;
-	uint64_t                  pa;
+	IOMemoryDescriptor *md;
+	uint64_t            pa;
 } g_flip[SWEET_FLIP_SLOTS];
 static uint32_t g_flip_count;    /* slots reserved by sweet_surface_flip_pool */
 static uint32_t g_flip_bytes;    /* size of one slot */
 static uint32_t g_flip_used;     /* bit i = slot i handed to a surface */
+static bool g_flip_vm_alloc;
+
+#define SWEET_SPLASH_SLOTS      3
+static struct {
+	uint64_t phys;
+	uint32_t region;
+	uint32_t slot;
+	uint32_t used;
+} g_splash;
 
 OSDefineMetaClassAndStructors(SweetSurface, OSObject);
 
@@ -100,16 +104,19 @@ SweetSurface::free()
 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
 	}
-	if (poolIdx < SWEET_FLIP_SLOTS && sweet_surface_lock != NULL) {
-		/* Give the slot back: compositors recreate surfaces on mode
-		 * changes and a leaked slot would silently cost a flip later. */
-		IOLockLock(sweet_surface_lock);
-		g_flip_used &= ~(1u << poolIdx);
-		IOLockUnlock(sweet_surface_lock);
-	}
-	poolIdx = ~0u;
 	OSSafeReleaseNULL(kernelMap);
 	OSSafeReleaseNULL(memory);
+	if (sweet_surface_lock != NULL &&
+	    (poolIdx < SWEET_FLIP_SLOTS || splashIdx != 0)) {
+		IOLockLock(sweet_surface_lock);
+		if (poolIdx < SWEET_FLIP_SLOTS) {
+			g_flip_used &= ~(1u << poolIdx);
+		}
+		if (splashIdx != 0) {
+			g_splash.used &= ~(1u << splashIdx);
+		}
+		IOLockUnlock(sweet_surface_lock);
+	}
 	OSSafeReleaseNULL(state);
 	OSObject::free();
 }
@@ -226,8 +233,12 @@ sweet_surface_alloc(void)
 {
 	sweet_surface_init_lock();
 	SweetSurface *s = OSTypeAlloc(SweetSurface);
-	if (s == NULL || !s->init()) {
-		OSSafeReleaseNULL(s);
+	if (s == NULL) {
+		return NULL;
+	}
+	s->poolIdx = ~0u;
+	if (!s->init()) {
+		s->release();
 		return NULL;
 	}
 	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
@@ -237,7 +248,6 @@ sweet_surface_alloc(void)
 		return NULL;
 	}
 	bzero(s->state->getBytesNoCopy(), page_size);
-	s->poolIdx = ~0u;
 	return s;
 }
 
@@ -251,78 +261,92 @@ sweet_surface_publish(SweetSurface *s)
 	return ok;
 }
 
-#define SWEET_SPLASH_SLOTS      3
-
-static struct {
-	uint64_t phys;
-	uint32_t region;
-	uint32_t slot;
-	uint32_t used;          /* bit i = slot i taken (slot 0 = panel) */
-	int      enabled;
-} g_splash;
-
-void
+static void
 sweet_surface_set_splash_pool(uint64_t phys, uint32_t region_bytes,
     uint32_t slot_bytes)
 {
 	int on = 1;
 
 	PE_parse_boot_argn("sweetfb_splash", &on, sizeof(on));
-	g_splash.enabled = 0;
-	g_splash.phys = 0;
-	g_splash.region = 0;
-	g_splash.slot = 0;
-	g_splash.used = 0;
-	if (on <= 0 || phys == 0 || region_bytes < slot_bytes * 2 || slot_bytes == 0) {
+	if (on <= 0 || phys == 0 || slot_bytes == 0 || region_bytes <= slot_bytes ||
+	    phys >= 0x100000000ull || region_bytes > 0x100000000ull - phys ||
+	    ((phys | region_bytes | slot_bytes) & (page_size - 1)) != 0) {
 		IOLog("SWEET SURF: splash pool off\n");
 		return;
 	}
-	slot_bytes = (uint32_t)round_page(slot_bytes);
-	if (slot_bytes * 2 > region_bytes) {
-		IOLog("SWEET SURF: splash region too small for 2 slots\n");
-		return;
-	}
+	IOLockLock(sweet_surface_lock);
 	g_splash.phys = phys;
 	g_splash.region = region_bytes;
 	g_splash.slot = slot_bytes;
-	g_splash.used = 1u;     /* slot 0 = panel framebuffer */
-	g_splash.enabled = 1;
-	IOLog("SWEET SURF: splash pool pa 0x%llx region %u slot %u (%u CA slots)\n",
-	    (unsigned long long)phys, region_bytes, slot_bytes,
-	    region_bytes / slot_bytes - 1);
+	IOLockUnlock(sweet_surface_lock);
+	IOLog("SWEET SURF: splash pool pa 0x%llx region %u slot %u\n",
+	    (unsigned long long)phys, region_bytes, slot_bytes);
 }
 
-/*
- * Reserve physically contiguous slot_bytes buffers below 4 GB. A single big
- * request is more likely to succeed than a later one, and the pool has to be
- * ready before CoreAnimation creates its surfaces, so this runs in start().
- */
-uint32_t
+/* Read a pair of 64-bit ADT cells without assuming 8-byte property alignment. */
+static bool
+sweet_surface_dt_range(const char *path, const char *key, uint64_t (&range)[2])
+{
+	DTEntry node;
+	const void *value;
+	unsigned int size;
+	if (SecureDTLookupEntry(NULL, path, &node) != kSuccess ||
+	    SecureDTGetProperty(node, key, &value, &size) != kSuccess ||
+	    size != sizeof(range)) {
+		return false;
+	}
+	memcpy(range, value, sizeof(range));
+	return true;
+}
+
+static void
 sweet_surface_flip_pool(uint32_t slot_bytes, uint32_t count)
 {
-	int flip = 0;
+	DTEntry chosen;
+	const void *value;
+	unsigned int size;
+	uint64_t dram_base = 0;
+	uint64_t reserved[2] = {};
 
-	if (g_flip_count != 0 || slot_bytes == 0 || count == 0) {
-		return g_flip_count;
+	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
+	    SecureDTGetProperty(chosen, "dram-base", &value, &size) == kSuccess &&
+	    size == sizeof(dram_base)) {
+		memcpy(&dram_base, value, sizeof(dram_base));
 	}
-	PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
-	if (flip <= 0) {
-		IOLog("SWEET SURF: flip pool off (sweetfb_flip=0)\n");
-		return 0;
+	const bool highmem = dram_base >= 0x100000000ull;
+	if (highmem) {
+		if (!sweet_surface_dt_range("/arm-io/disp0", "scanout-reg", reserved) ||
+		    reserved[0] < 0xb0000000ull || reserved[0] >= 0xfd000000ull ||
+		    reserved[1] > 0xfd000000ull - reserved[0] ||
+		    (reserved[0] & (page_size - 1)) != 0) {
+			IOLog("SWEET SURF: highmem without a valid scanout-reg\n");
+			return;
+		}
+		if (count > reserved[1] / slot_bytes) {
+			count = (uint32_t)(reserved[1] / slot_bytes);
+		}
 	}
 	if (count > SWEET_FLIP_SLOTS) {
 		count = SWEET_FLIP_SLOTS;
 	}
-	slot_bytes = (uint32_t)round_page(slot_bytes);
+	IOLockLock(sweet_surface_lock);
+	g_flip_vm_alloc = !highmem;
 	for (uint32_t i = 0; i < count; i++) {
-		IOBufferMemoryDescriptor *md =
-		    IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-		    kIODirectionInOut | kIOMemoryKernelUserShared |
-		    kIOMemoryPhysicallyContiguous, slot_bytes, 0x00000000ffffffffull);
 		IOByteCount len = 0;
-		addr64_t pa = md != NULL ? md->getPhysicalSegment(0, &len) : 0;
+		IOMemoryDescriptor *md;
+		addr64_t pa;
+		if (highmem) {
+			pa = reserved[0] + (uint64_t)i * slot_bytes;
+			md = NULL;  /* Make a descriptor of exactly allocSize at checkout. */
+			len = slot_bytes;
+		} else {
+			md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+			    kIODirectionInOut | kIOMemoryKernelUserShared |
+			    kIOMemoryPhysicallyContiguous, slot_bytes, 0x00000000ffffffffull);
+			pa = md != NULL ? md->getPhysicalSegment(0, &len) : 0;
+		}
 
-		if (md == NULL || pa == 0 || len < slot_bytes ||
+		if ((!highmem && md == NULL) || pa == 0 || len < slot_bytes ||
 		    pa > 0xffffffffull || pa + slot_bytes > 0x100000000ull) {
 			IOLog("SWEET SURF: flip pool slot %u of %u bytes: %s\n", i,
 			    slot_bytes, md == NULL ? "contiguous alloc failed" :
@@ -333,14 +357,29 @@ sweet_surface_flip_pool(uint32_t slot_bytes, uint32_t count)
 		g_flip[i].md = md;
 		g_flip[i].pa = pa;
 		g_flip_count++;
-		IOLog("SWEET SURF: flip pool %u pa 0x%llx %u bytes\n", i,
-		    (unsigned long long)pa, slot_bytes);
+		IOLog("SWEET SURF: flip pool %u pa 0x%llx %u bytes (%s)\n", i,
+		    (unsigned long long)pa, slot_bytes, highmem ? "reserved" : "wired");
 	}
 	g_flip_bytes = slot_bytes;
-	IOLog("SWEET SURF: flip pool %u slots of %u bytes (%u KB wired) -> "
-	    "%s\n", g_flip_count, slot_bytes, (g_flip_count * slot_bytes) / 1024u,
-	    g_flip_count != 0 ? "every CA layer can flip" : "splash slot only");
-	return g_flip_count;
+	IOLockUnlock(sweet_surface_lock);
+}
+
+void
+sweet_surface_init_scanout(uint64_t panel_pa, uint64_t panel_bytes,
+    uint32_t slot_bytes, uint32_t count)
+{
+	uint64_t splash[2];
+	if (slot_bytes == 0 || (slot_bytes & (page_size - 1)) != 0) {
+		return;
+	}
+	if (sweet_surface_dt_range("/sweet-fbcon", "reg", splash) &&
+	    splash[0] == panel_pa && splash[1] <= UINT32_MAX &&
+	    panel_bytes <= slot_bytes) {
+		sweet_surface_set_splash_pool(panel_pa, (uint32_t)splash[1], slot_bytes);
+	}
+	if (count != 0) {
+		sweet_surface_flip_pool(slot_bytes, count);
+	}
 }
 
 static bool
@@ -349,7 +388,8 @@ sweet_surface_is_display_layer(SweetSurface *s)
 	if (s == NULL) {
 		return false;
 	}
-	if (s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
+	if (s->pixelFormat != 0x42475241u || s->planeCount != 0 ||
+	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
 		return false;
 	}
 	if (s->width < 720 || s->height < 1280 || s->allocSize < (2u << 20)) {
@@ -358,63 +398,50 @@ sweet_surface_is_display_layer(SweetSurface *s)
 	return true;
 }
 
-/*
- * Prefer a splash slot (DPU already scans this RAM). Falls back to contiguous
- * DRAM only when sweetfb_flip=1 and splash is exhausted/off.
- */
 static bool
 sweet_surface_want_contig(SweetSurface *s)
 {
-	static int flip = -1;
-
-	if (flip < 0) {
-		flip = 0;
-		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
-	}
-	return flip > 0 && sweet_surface_is_display_layer(s);
+	IOLockLock(sweet_surface_lock);
+	bool enabled = g_flip_vm_alloc;
+	IOLockUnlock(sweet_surface_lock);
+	return enabled && sweet_surface_is_display_layer(s);
 }
 
 static IOMemoryDescriptor *
 sweet_surface_splash_alloc(SweetSurface *s, uint64_t *out_pa)
 {
-	uint32_t i, n;
-	uint64_t pa;
-
 	*out_pa = 0;
-	if (!g_splash.enabled || !sweet_surface_is_display_layer(s)) {
+	if (!sweet_surface_is_display_layer(s)) {
 		return NULL;
 	}
-	if (s->allocSize > g_splash.slot) {
-		return NULL;
-	}
-	n = g_splash.region / g_splash.slot;
-	if (n > SWEET_SPLASH_SLOTS) {
-		n = SWEET_SPLASH_SLOTS;
-	}
-	for (i = 1; i < n; i++) {
+	IOLockLock(sweet_surface_lock);
+	for (uint32_t i = 1; g_splash.slot != 0 && i < SWEET_SPLASH_SLOTS; i++) {
+		uint64_t offset = (uint64_t)i * g_splash.slot;
+		if (offset + s->allocSize > g_splash.region || s->allocSize > g_splash.slot) {
+			break;
+		}
 		if (g_splash.used & (1u << i)) {
 			continue;
 		}
-		pa = g_splash.phys + (uint64_t)i * g_splash.slot;
+		uint64_t pa = g_splash.phys + offset;
 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa,
 		    s->allocSize, kIODirectionInOut);
 		if (md == NULL) {
-			return NULL;
+			break;
 		}
 		g_splash.used |= (1u << i);
+		s->splashIdx = i;
 		*out_pa = pa;
+		IOLockUnlock(sweet_surface_lock);
 		IOLog("SWEET SURF: splash slot %u pa 0x%llx size %u\n",
 		    i, (unsigned long long)pa, s->allocSize);
 		return md;
 	}
+	IOLockUnlock(sweet_surface_lock);
 	return NULL;
 }
 
-/*
- * A reserved flip-pool slot for a full-screen layer, or NULL. Preferred over
- * the splash slot: it is the only way to keep every surface of a rotating
- * compositor flippable.
- */
+/* Preferred over splash slots, with a descriptor scoped to the requested size. */
 static IOMemoryDescriptor *
 sweet_surface_pool_alloc(SweetSurface *s, uint64_t *out_pa, uint32_t *out_idx)
 {
@@ -422,23 +449,31 @@ sweet_surface_pool_alloc(SweetSurface *s, uint64_t *out_pa, uint32_t *out_idx)
 
 	*out_pa = 0;
 	*out_idx = ~0u;
-	if (g_flip_count == 0 || !sweet_surface_is_display_layer(s) ||
-	    s->allocSize > g_flip_bytes) {
+	if (!sweet_surface_is_display_layer(s)) {
 		return NULL;
 	}
 	IOLockLock(sweet_surface_lock);
-	for (i = 0; i < g_flip_count; i++) {
+	for (i = 0; i < g_flip_count && s->allocSize <= g_flip_bytes; i++) {
 		if (g_flip_used & (1u << i)) {
 			continue;
 		}
+		IOMemoryDescriptor *md = g_flip[i].md;
+		if (md != NULL) {
+			md->retain();  /* held by the pool and the surface */
+		} else {
+			md = IOMemoryDescriptor::withPhysicalAddress(g_flip[i].pa,
+			    s->allocSize, kIODirectionInOut);
+			if (md == NULL) {
+				break;
+			}
+		}
 		g_flip_used |= 1u << i;
-		g_flip[i].md->retain();        /* held by the pool and the surface */
 		*out_pa = g_flip[i].pa;
 		*out_idx = i;
 		IOLockUnlock(sweet_surface_lock);
 		IOLog("SWEET SURF: flip slot %u pa 0x%llx size %u\n", i,
 		    (unsigned long long)*out_pa, s->allocSize);
-		return g_flip[i].md;
+		return md;
 	}
 	IOLockUnlock(sweet_surface_lock);
 	return NULL;
@@ -941,41 +976,37 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		uint64_t splash_pa = 0;
 		uint64_t pool_pa = 0;
 		uint32_t pool_idx = ~0u;
-		bool splash = false;
 
 		/*
 		 * Full-screen layers: a reserved flip-pool slot first, then the ABL
-		 * splash carve-out the DPU already scans, then wired pages. Only the
-		 * first two are addressable by the display controller, so how many
-		 * layers can flip is decided here.
+		 * splash carve-out, then an ordinary IOSurface allocation.
 		 */
 		mem = sweet_surface_pool_alloc(s, &pool_pa, &pool_idx);
 		if (mem != NULL) {
 			s->poolIdx = pool_idx;
 			s->physAddr = pool_pa;
-			s->mapCache = kIOMapDefaultCache;
-			OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+			if (OSDynamicCast(IOBufferMemoryDescriptor, mem) != NULL) {
+				OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+			}
 		} else if ((mem = sweet_surface_splash_alloc(s, &splash_pa)) != NULL) {
-			splash = true;
 			s->physAddr = splash_pa;
-			s->mapCache = kIOMapCopybackCache;
 			/* Splash RAM is not charged to the wired budget. */
-		} else if ((uint64_t)OSAddAtomic64(s->allocSize,
-		    (volatile SInt64 *)&sweet_surface_wired) + s->allocSize <=
-		    SWEET_SURFACE_WIRED_MAX) {
-			IOBufferMemoryDescriptor *buf = NULL;
-			if (sweet_surface_want_contig(s)) {
-				buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-				    kIODirectionInOut | kIOMemoryKernelUserShared |
-				    kIOMemoryPhysicallyContiguous,
-				    s->allocSize, 0x00000000ffffffffull);
+		} else {
+			uint64_t wired = (uint64_t)OSAddAtomic64(s->allocSize,
+			    (volatile SInt64 *)&sweet_surface_wired) + s->allocSize;
+			if (wired <= SWEET_SURFACE_WIRED_MAX) {
+				if (sweet_surface_want_contig(s)) {
+					mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+					    kIODirectionInOut | kIOMemoryKernelUserShared |
+					    kIOMemoryPhysicallyContiguous,
+					    s->allocSize, 0x00000000ffffffffull);
+				}
+				if (mem == NULL) {
+					mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+					    kIODirectionInOut | kIOMemoryKernelUserShared,
+					    s->allocSize, page_size);
+				}
 			}
-			if (buf == NULL) {
-				buf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-				    kIODirectionInOut | kIOMemoryKernelUserShared,
-				    s->allocSize, page_size);
-			}
-			mem = buf;
 			if (mem == NULL) {
 				OSAddAtomic64(-(SInt64)s->allocSize,
 				    (volatile SInt64 *)&sweet_surface_wired);
@@ -984,21 +1015,19 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		if (mem == NULL) {
 			ret = kIOReturnNoMemory;
 		} else {
-			if (!splash) {
-				IOBufferMemoryDescriptor *buf =
-				    OSDynamicCast(IOBufferMemoryDescriptor, mem);
-				if (buf != NULL) {
-					bzero(buf->getBytesNoCopy(), s->allocSize);
-				}
-				s->mapCache = kIOMapDefaultCache;
-			}
 			s->memory = mem;
-			if (!splash && pool_idx == ~0u && sweet_surface_want_contig(s)) {
-				/* Pool slots already carry the PA we allocated them at; only
-				 * a fresh contiguous buffer needs to be interrogated. */
+			IOBufferMemoryDescriptor *buf = OSDynamicCast(IOBufferMemoryDescriptor, mem);
+			s->mapCache = buf != NULL ? kIOMapDefaultCache : kIOMapCopybackCache;
+			uintptr_t pixels = s->kernelAddress();
+			if (pixels != 0) {
+				bzero((void *)pixels, s->allocSize);
+			}
+			if (buf != NULL && pool_idx == ~0u && sweet_surface_want_contig(s)) {
 				sweet_surface_capture_phys(s);
 			}
-			if (!sweet_surface_publish(s)) {
+			if (pixels == 0) {
+				ret = kIOReturnVMError;
+			} else if (!sweet_surface_publish(s)) {
 				ret = kIOReturnNoResources;
 			}
 		}

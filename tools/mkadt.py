@@ -31,6 +31,10 @@ SOC_BASE = 0x01000000
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
+# Reserve two 12 MiB scanout buffers at the end of the low-memory XNU
+# window when the high-memory boot leaves that window out of its VM.
+SCANOUT_SIZE = 24 << 20
+SCANOUT_BASE = PHYS_BASE + MEM_SIZE - SCANOUT_SIZE
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2340, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
@@ -192,7 +196,8 @@ def build(seed=None, qemu=False, highmem=False, native=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(canvas_w)),
             ('canvas-height', u32(canvas_h)),
-        ]),
+        ] + ([('scanout-reg', u64(SCANOUT_BASE, SCANOUT_SIZE))]
+             if highmem and not qemu else [])),
         # Adreno 618: SweetAccelerator (AGXAccelerator) matches sweet,gpu when
         # sweetgpu>=3. Nub is always published; the driver decides whether to
         # registerService. See docs/GPU.md.

@@ -49,7 +49,16 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
 #define SSPP_SRC_FORMAT     0x030u
 #define SSPP_SRC_UNPACK     0x034u
 #define SSPP_SRC_OP_MODE    0x038u
+#define SSPP_FETCH_CONFIG   0x048u
+#define SSPP_DECIMATION     0x0b4u
+#define SSPP_PIX_EXT_C0     0x100u
+#define SSPP_PIX_EXT_C1C2   0x110u
+#define SSPP_PIX_EXT_C3     0x120u
+#define SSPP_CDP_CNTL       0x134u
 #define SSPP_MULTIRECT_MODE 0x170u
+#define VIG_QSEED3_OP_MODE  0xa04u
+#define VIG_CSC10_OP_MODE   0x1a00u
+#define SDE_REV_SM7150      0x50020000u
 #define CTL_FLUSH           0x018u
 #define CTL_START           0x01Cu
 #define CTL_LAYER           0x000u
@@ -106,6 +115,33 @@ static const struct sweet_dpu_block kDpuBlocks[] = {
 
 #define SWEET_DPU_LIVE_WORDS    64
 
+/* SM7150 VIG, single-plane linear BGRA8, one source pixel per output pixel.
+ * Offsets follow the vendor SDE driver and davinci's VIG sub-block offsets.
+ * Pixel extension requests the existing panel width/height with no taps.
+ */
+static const struct {
+	uint32_t off;
+	uint32_t value;
+} kLinearVig[] = {
+	{ SSPP_SRC_FORMAT,       0x000237ffu },
+	{ SSPP_SRC_UNPACK,       0x03020001u },
+	{ SSPP_SRC_OP_MODE,      1u << 31 }, /* software pixel extension only */
+	{ SSPP_FETCH_CONFIG,     0x87u },
+	{ SSPP_DECIMATION,       0 },
+	{ SSPP_PIX_EXT_C0,       0 },
+	{ SSPP_PIX_EXT_C0 + 4,   0 },
+	{ SSPP_PIX_EXT_C0 + 8,   0 },
+	{ SSPP_PIX_EXT_C1C2,     0 },
+	{ SSPP_PIX_EXT_C1C2 + 4, 0 },
+	{ SSPP_PIX_EXT_C1C2 + 8, 0 },
+	{ SSPP_PIX_EXT_C3,       0 },
+	{ SSPP_PIX_EXT_C3 + 4,   0 },
+	{ SSPP_PIX_EXT_C3 + 8,   0 },
+	{ SSPP_CDP_CNTL,         0x9u }, /* linear preload, no UBWC metadata/tile amortization */
+	{ VIG_QSEED3_OP_MODE,    (1u << 14) | (1u << 10) }, /* 8-bit BGRA, scaler off */
+	{ VIG_CSC10_OP_MODE,     0 }, /* no YUV conversion */
+};
+
 struct sweet_dpu_state {
 	vm_offset_t mdss;
 	uint32_t    sspp_off;
@@ -119,7 +155,7 @@ struct sweet_dpu_state {
 	uint32_t    ctl_bits;       /* bit i = ctl i carries a live LAYER */
 	uint32_t    flush_mask;
 	uint32_t    orig_pa;
-	uint32_t    orig_stride;
+	uint32_t    orig_ystride;
 	uint32_t    orig_src_size;
 	uint32_t    orig_out_size;
 	uint32_t    orig_src_xy;
@@ -129,6 +165,8 @@ struct sweet_dpu_state {
 	uint32_t    cur_x, cur_y;    /* source window origin */
 	uint32_t    cur_w, cur_h;    /* source window size (= panel) */
 	uint32_t    flips_logged;
+	uint32_t    panel_w, panel_h;
+	uint32_t    orig_vig[sizeof(kLinearVig) / sizeof(kLinearVig[0])];
 	int         size_enc;       /* index into kSizeEnc, 0 = unknown */
 	int         geom_guess;     /* size packing could not be decoded */
 	int         geom_write;     /* sweetfb_geom, default on */
@@ -136,6 +174,7 @@ struct sweet_dpu_state {
 	int         video_mode;     /* INTF/PP counters moved */
 	int         ready;
 	int         disabled;       /* a flip failed to latch, stay on CPU copy */
+	bool        linear_vig;
 	const char *sspp_name;
 };
 
@@ -267,13 +306,6 @@ dpu_dump_block(vm_offset_t base, const struct sweet_dpu_block *b,
 		} else if (v == fb_stride || (v & 0xffffu) == fb_stride) {
 			IOLog("SWEET DPU: %s+0x%03x is the panel stride\n",
 			    b->name, off);
-			if (b->flush != 0) {
-				g_dpu.orig_stride = fb_stride;
-				g_dpu.cur_stride = fb_stride;
-				if (g_dpu.sspp_off == b->off) {
-					g_dpu.src_stride_off = b->off + off;
-				}
-			}
 		}
 	}
 }
@@ -363,8 +395,8 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 	g_dpu_verbose = mode;
 
 	bzero(&g_dpu, sizeof(g_dpu));
-	g_dpu.orig_stride = fb_stride;
-	g_dpu.cur_stride = fb_stride;
+	g_dpu.panel_w = fb_width;
+	g_dpu.panel_h = fb_height;
 
 	mdss = ml_io_map(MDSS_PA, MDSS_SIZE);
 	if (mdss == 0) {
@@ -423,8 +455,21 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 		g_dpu.orig_src_size = src;
 		g_dpu.orig_out_size = out;
 		g_dpu.orig_src_xy = src_xy;
+		g_dpu.orig_ystride = dpu_rd(mdss, g_dpu.src_stride_off);
+		g_dpu.cur_stride = g_dpu.orig_ystride & 0xffffu;
 		PE_parse_boot_argn("sweetfb_geom", &geom, sizeof(geom));
 		g_dpu.geom_write = geom > 0;
+		g_dpu.linear_vig = dpu_rd(mdss, MDSS_SDE_OFF) == SDE_REV_SM7150 &&
+		    (g_dpu.sspp_off == 0x5000u || g_dpu.sspp_off == 0x7000u) &&
+		    g_dpu.src_addr_off == g_dpu.sspp_off + SSPP_SRC0_ADDR &&
+		    multi == 0 && g_dpu.geom_write;
+		if (g_dpu.linear_vig) {
+			for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
+				uint32_t off = kLinearVig[i].off;
+				g_dpu.orig_vig[i] = dpu_rd(mdss, g_dpu.sspp_off + off);
+				IOLog("SWEET DPU: boot sspp+0x%03x=0x%08x\n", off, g_dpu.orig_vig[i]);
+			}
+		}
 
 		for (int e = 1; e <= (int)SWEET_SIZE_ENCS; e++) {
 			dpu_size_decode(out, e, &dw, &dh);
@@ -511,16 +556,19 @@ dpu_restore(void)
 	if (!g_dpu.ready || g_dpu.mdss == 0) {
 		return;
 	}
+	if (g_dpu.linear_vig) {
+		for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
+			dpu_wr(g_dpu.mdss, g_dpu.sspp_off + kLinearVig[i].off, g_dpu.orig_vig[i]);
+		}
+	}
 	dpu_wr(g_dpu.mdss, g_dpu.src_size_off, g_dpu.orig_src_size);
 	dpu_wr(g_dpu.mdss, g_dpu.out_size_off, g_dpu.orig_out_size);
 	dpu_wr(g_dpu.mdss, g_dpu.src_xy_off, g_dpu.orig_src_xy);
-	dpu_wr(g_dpu.mdss, g_dpu.src_stride_off,
-	    (dpu_rd(g_dpu.mdss, g_dpu.src_stride_off) & 0xffff0000u) |
-	    (g_dpu.orig_stride & 0xffffu));
+	dpu_wr(g_dpu.mdss, g_dpu.src_stride_off, g_dpu.orig_ystride);
 	dpu_wr(g_dpu.mdss, g_dpu.src_addr_off, g_dpu.orig_pa);
 	dpu_commit();
 	g_dpu.cur_pa = g_dpu.orig_pa;
-	g_dpu.cur_stride = g_dpu.orig_stride;
+	g_dpu.cur_stride = g_dpu.orig_ystride & 0xffffu;
 	g_dpu.cur_src_size = g_dpu.orig_src_size;
 	/* The origin the bootloader left, not 0: a later crop flip only writes
 	 * SRC_XY when it differs from this. */
@@ -554,6 +602,26 @@ dpu_dump_sspp(void)
 	}
 	IOLog("SWEET DPU: after flip sspp+0x000..0x1ec, %u nonzero words\n",
 	    n);
+	if (g_dpu.linear_vig) {
+		for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
+			uint32_t off = kLinearVig[i].off;
+			IOLog("SWEET DPU: linear sspp+0x%03x 0x%08x -> 0x%08x\n",
+			    off, g_dpu.orig_vig[i], dpu_rd(g_dpu.mdss, g_dpu.sspp_off + off));
+		}
+	}
+}
+
+static uint32_t
+dpu_linear_vig_value(unsigned int i, uint32_t size)
+{
+	switch (kLinearVig[i].off) {
+	case SSPP_PIX_EXT_C0 + 8:
+	case SSPP_PIX_EXT_C1C2 + 8:
+	case SSPP_PIX_EXT_C3 + 8:
+		return size;
+	default:
+		return kLinearVig[i].value;
+	}
 }
 
 /*
@@ -581,6 +649,11 @@ sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
 	if (!sweet_display_can_flip() || phys == 0 || width == 0 || height == 0) {
 		return false;
 	}
+	if (g_dpu.linear_vig && (width != g_dpu.panel_w || height != g_dpu.panel_h)) {
+		return false;
+	}
+	const bool setup_linear = g_dpu.linear_vig && !g_dpu.dirty;
+	const uint32_t pixel_ext_size = (height << 16) | width;
 	if (g_dpu.cur_pa == phys && g_dpu.dirty &&
 	    g_dpu.cur_stride == stride && g_dpu.cur_x == x && g_dpu.cur_y == y &&
 	    g_dpu.cur_w == width && g_dpu.cur_h == height) {
@@ -617,11 +690,31 @@ sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
 		}
 		g_dpu.cur_stride = stride;
 	}
+	if (setup_linear) {
+		for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
+			dpu_wr(g_dpu.mdss, g_dpu.sspp_off + kLinearVig[i].off,
+			    dpu_linear_vig_value(i, pixel_ext_size));
+		}
+	}
 	dpu_wr(g_dpu.mdss, g_dpu.src_addr_off, phys);
 	dpu_commit();
 
 	latched = dpu_rd(g_dpu.mdss, g_dpu.src_addr_off);
 	out = dpu_rd(g_dpu.mdss, g_dpu.out_size_off);
+	if (setup_linear) {
+		for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
+			uint32_t off = kLinearVig[i].off;
+			uint32_t expected = dpu_linear_vig_value(i, pixel_ext_size);
+			uint32_t actual = dpu_rd(g_dpu.mdss, g_dpu.sspp_off + off);
+			if (actual != expected) {
+				IOLog("SWEET DPU: linear sspp+0x%03x readback 0x%08x expected 0x%08x\n",
+				    off, actual, expected);
+				dpu_restore();
+				g_dpu.disabled = 1;
+				return false;
+			}
+		}
+	}
 	if (latched != phys || (wrote_size &&
 	    out != dpu_size_pack(width, height, g_dpu.size_enc))) {
 		IOLog("SWEET DPU: flip did not stick (addr 0x%08x/0x%08x out "
