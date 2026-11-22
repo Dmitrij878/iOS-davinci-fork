@@ -89,7 +89,8 @@ enum {
  * rdar://45025538 bar for 360x800 points). The display is therefore
  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
  * centered 1080x2340 part of it is shown on the 1080x2340 panel.
- * Boot-arg sweetfb_native=1 presents the real panel size instead.
+ * Boot-arg sweetfb_native=1 presents the real panel size instead and enables
+ * packed scanout on the 1080x2340 davinci panel.
  */
 #define SWEET_FB_LOGICAL_W              1125
 #define SWEET_FB_LOGICAL_H              2436
@@ -119,6 +120,7 @@ public:
 	uint64_t      fPhys;
 	uint32_t      fWidth, fHeight, fRowBytes;
 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+	bool          fPackedScanout;
 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
 	IOMemoryMap  *fMap;
@@ -197,6 +199,7 @@ AppleCLCD::start(IOService *provider)
 		fLogicalW = SWEET_FB_LOGICAL_W;
 		fLogicalH = SWEET_FB_LOGICAL_H;
 	}
+	fPackedScanout = native && fWidth == 1080 && fHeight == 2340 && fRowBytes == fWidth * 4;
 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
 	fLock = IOLockAlloc();
@@ -261,7 +264,7 @@ AppleCLCD::start(IOService *provider)
 	uint32_t slots = 3;
 	PE_parse_boot_argn("sweetfb_flipslots", &slots, sizeof(slots));
 	sweet_surface_init_scanout(fPhys, (uint64_t)fRowBytes * fHeight,
-	    12u << 20, fFlipMode != 0 ? slots : 0);
+	    12u << 20, fFlipMode != 0 ? slots : 0, fPackedScanout ? fSurface : NULL);
 	/* Finish the hardware probe before a client can queue its first flip. */
 	sweet_display_probe(fPhys, fRowBytes, fWidth, fHeight);
 	fPresentTimer->setTimeoutUS(fPeriodUS);
@@ -274,6 +277,9 @@ AppleCLCD::start(IOService *provider)
 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fPeriodUS,
 	    fCacheMode != 0 ? "cached" : "write-combined",
 	    fFlipMode != 0 ? "on" : "off");
+	if (fPackedScanout) {
+		IOLog("SWEET FB: native scanout uses the panel stride %u\n", fRowBytes);
+	}
 	if (fFlipMode != 0 && !sweet_display_can_flip()) {
 		IOLog("SWEET FB: sweetfb_flip=1 but DPU layer not found, CPU copy stays\n");
 	}
@@ -569,17 +575,14 @@ sweet_fb_chart(uint8_t *dst, uint32_t bpr, uint32_t w, uint32_t h)
 
 /*
  * Zero-copy present: point the live SSPP at the CA surface and let the DPU
- * fetch it. The bootloader's pipeline is kept (same format, same panel-sized
- * source window, same mixers); only SRC_ADDR, SRC_YSTRIDE0 and SRC_XY move,
- * so a bad guess costs one frame instead of the panel - and sweet_display_*
- * restores the splash buffer and disables the flip if the write does not
- * latch.
+ * fetch it. The bootloader's route and panel-sized window are kept, while
+ * the fetch uses the surface's address, pitch and crop. A register readback
+ * mismatch restores the splash buffer and disables further flips.
  *
  * The window is exactly the one the CPU crop-copy below uses: a full panel
  * rect, cropped out of a larger logical surface when CoreAnimation draws
- * 1125x2436 for the 1080x2340 panel. That is what makes native and logical
- * mode flip the same way, and it is why the surface pitch (4320/4352/4608)
- * must be programmed as YSTRIDE instead of the ABL's 4320.
+ * 1125x2436 for the 1080x2340 panel. Native packed scanout flips only
+ * surfaces whose pitch already matches the panel.
  */
 static bool
 sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
@@ -664,7 +667,8 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		s->release();
 		return false;
 	}
-	if (s->bytesPerRow == 0 || s->bytesPerRow > 0xffffu) {
+	if (s->bytesPerRow == 0 || s->bytesPerRow > 0xffffu ||
+	    (fb->fPackedScanout && s->bytesPerRow != fb->fRowBytes)) {
 		s->release();
 		return false;
 	}

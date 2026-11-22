@@ -58,9 +58,9 @@ public:
  */
 uint64_t sweet_surface_phys(SweetSurface *s);
 
-/* Set up the splash and scanout slots before publishing the display. */
+/* Set up scanout slots and the optional native layout before publishing the display. */
 void sweet_surface_init_scanout(uint64_t panel_pa, uint64_t panel_bytes,
-    uint32_t slot_bytes, uint32_t count);
+    uint32_t slot_bytes, uint32_t count, const SweetSurface *packed_panel);
 
 /* Retained surface for an id, or NULL. */
 SweetSurface *sweet_surface_copy(uint32_t id);

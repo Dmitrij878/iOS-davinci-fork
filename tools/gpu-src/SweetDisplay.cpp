@@ -59,9 +59,18 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
 #define VIG_QSEED3_OP_MODE  0xa04u
 #define VIG_CSC10_OP_MODE   0x1a00u
 #define SDE_REV_SM7150      0x50020000u
+#define CTL_TOP             0x014u
 #define CTL_FLUSH           0x018u
 #define CTL_START           0x01Cu
 #define CTL_LAYER           0x000u
+#define CTL_LAYER_EXT       0x040u
+#define CTL_INTF_ACTIVE     0x0f4u
+#define CTL_INTF_FLUSH      0x110u
+#define CTL_COMMAND_MODE    (1u << 17) /* CTL_TOP */
+#define CTL_FLUSH_LM0       (1u << 6)
+#define CTL_FLUSH_CTL       (1u << 17)
+#define CTL_FLUSH_INTF      (1u << 31)
+#define CTL_INTF_MASK       0x3fu
 #define SSPP_ADDR_ALIGN     64u
 
 /* Vendor SDE packs counts minus one and treats DRM ARGB8888 as bytes BGRA. */
@@ -149,6 +158,9 @@ static const struct {
 	{ VIG_CSC10_OP_MODE,     0 }, /* no YUV conversion */
 };
 
+/* qcom,sde-ctl-off on davinci. */
+static const uint32_t kCtlOffsets[] = { 0x02000u, 0x02200u, 0x02400u, 0x02600u };
+
 struct sweet_dpu_state {
 	vm_offset_t mdss;
 	uint32_t    sspp_off;
@@ -158,9 +170,13 @@ struct sweet_dpu_state {
 	uint32_t    src_size_off;
 	uint32_t    out_xy_off;
 	uint32_t    out_size_off;
-	uint32_t    ctl_off;
-	uint32_t    ctl_bits;       /* bit i = ctl i carries a live LAYER */
+	uint32_t    ctl_bits;       /* bit i = ctl i drives this scanout */
 	uint32_t    flush_mask;
+	uint32_t    ctl_kick_bits;
+	struct {
+		uint32_t flush;
+		uint32_t intf;
+	} ctl[sizeof(kCtlOffsets) / sizeof(kCtlOffsets[0])];
 	uint32_t    orig_pa;
 	uint32_t    orig_ystride;
 	uint32_t    orig_src_size;
@@ -265,13 +281,6 @@ dpu_enc_name(void)
 	return kSizeEnc[g_dpu.size_enc - 1].minus1 ? "w-low,s-1" : "w-low";
 }
 
-/*
- * CTL offsets of the 4 SDE control paths (dtb qcom,sde-ctl-off). Every CTL
- * that has a layer programmed gets the flush and the command-mode kick, so
- * a wrong guess about which CTL drives DSI0 cannot eat the update.
- */
-static const uint32_t kCtlOffsets[] = { 0x02000u, 0x02200u, 0x02400u, 0x02600u };
-
 /* sweetdpu=1: discover quietly. sweetdpu=2: dump every nonzero register. */
 static int g_dpu_verbose;
 
@@ -292,11 +301,12 @@ dpu_log_route(const char *phase)
 			continue;
 		}
 		IOLog("SWEET DPU: %s ctl%u lm0=%08x lm1=%08x lm2=%08x lm3=%08x top=%08x "
-		    "merge=%08x dsc=%08x intf=%08x\n", phase, i,
+		    "merge=%08x dsc=%08x intf=%08x flush=%08x intf_flush=%08x start=%08x\n", phase, i,
 		    dpu_rd(base, ctl), dpu_rd(base, ctl + 4), dpu_rd(base, ctl + 8),
-		    dpu_rd(base, ctl + 0xc), dpu_rd(base, ctl + 0x14),
+		    dpu_rd(base, ctl + 0xc), dpu_rd(base, ctl + CTL_TOP),
 		    dpu_rd(base, ctl + 0xe4), dpu_rd(base, ctl + 0xe8),
-		    dpu_rd(base, ctl + 0xf4));
+		    dpu_rd(base, ctl + CTL_INTF_ACTIVE), dpu_rd(base, ctl + CTL_FLUSH),
+		    dpu_rd(base, ctl + CTL_INTF_FLUSH), dpu_rd(base, ctl + CTL_START));
 	}
 	for (unsigned int i = 0; i < 2; i++) {
 		uint32_t lm = 0x45000 + i * 0x1000;
@@ -387,8 +397,42 @@ dpu_check_live(vm_offset_t base, const struct sweet_dpu_block *b)
 }
 
 static void
-dpu_pick_ctls(vm_offset_t base)
+dpu_pick_ctls(vm_offset_t base, bool active_vig)
 {
+	if (active_vig) {
+		/* Vendor CTL_LAYER/EXT stage fields for VIG rect0. */
+		const unsigned int vig = g_dpu.sspp_off == 0x7000u ? 1 : 0;
+		const uint32_t stage_mask = 7u << (3 * vig);
+		const uint32_t ext_mask = 1u << (2 * vig);
+		for (unsigned int i = 0; i < sizeof(kCtlOffsets) / sizeof(kCtlOffsets[0]); i++) {
+			const uint32_t ctl = kCtlOffsets[i];
+			const uint32_t intf = dpu_rd(base, ctl + CTL_INTF_ACTIVE) & CTL_INTF_MASK;
+			uint32_t mixers = 0;
+			for (unsigned int lm = 0; lm < 4; lm++) {
+				if ((dpu_rd(base, ctl + CTL_LAYER + 4 * lm) & stage_mask) ||
+				    (dpu_rd(base, ctl + CTL_LAYER_EXT + 4 * lm) & ext_mask)) {
+					mixers |= CTL_FLUSH_LM0 << lm;
+				}
+			}
+			if (intf == 0 || mixers == 0) {
+				continue;
+			}
+			g_dpu.ctl[i].intf = intf;
+			g_dpu.ctl[i].flush = g_dpu.flush_mask | mixers | CTL_FLUSH_CTL | CTL_FLUSH_INTF;
+			g_dpu.ctl_bits |= 1u << i;
+			if (dpu_rd(base, ctl + CTL_TOP) & CTL_COMMAND_MODE) {
+				g_dpu.ctl_kick_bits |= 1u << i;
+			}
+			IOLog("SWEET DPU: ctl%u drives vig%u flush=0x%08x intf_flush=0x%08x %s\n",
+			    i, vig, g_dpu.ctl[i].flush, intf,
+			    (g_dpu.ctl_kick_bits & (1u << i)) ? "command" : "video");
+		}
+		if (g_dpu.ctl_bits == 0) {
+			IOLog("SWEET DPU: no active interface routed from vig%u, flip disabled\n", vig);
+		}
+		return;
+	}
+
 	for (unsigned int i = 0; i < sizeof(kCtlOffsets) / sizeof(kCtlOffsets[0]); i++) {
 		uint32_t layer = dpu_rd(base, kCtlOffsets[i] + CTL_LAYER);
 
@@ -402,7 +446,9 @@ dpu_pick_ctls(vm_offset_t base)
 		g_dpu.ctl_bits = 1u << 0;
 		IOLog("SWEET DPU: no live CTL_LAYER, defaulting to ctl0\n");
 	}
-	g_dpu.ctl_off = kCtlOffsets[0];
+	if (!g_dpu.video_mode) {
+		g_dpu.ctl_kick_bits = g_dpu.ctl_bits;
+	}
 }
 
 /* Flush + kick every live CTL; the panels that need it run in command mode. */
@@ -413,9 +459,16 @@ dpu_commit(void)
 		if (!(g_dpu.ctl_bits & (1u << i))) {
 			continue;
 		}
-		dpu_wr(g_dpu.mdss, kCtlOffsets[i] + CTL_FLUSH, g_dpu.flush_mask);
-		if (!g_dpu.video_mode) {
-			dpu_wr(g_dpu.mdss, kCtlOffsets[i] + CTL_START, 1u);
+		const uint32_t ctl = kCtlOffsets[i];
+		uint32_t flush = g_dpu.flush_mask;
+		if (g_dpu.ctl[i].intf != 0) {
+			/* Active-config SDE takes the interface submask first. */
+			dpu_wr(g_dpu.mdss, ctl + CTL_INTF_FLUSH, g_dpu.ctl[i].intf);
+			flush = g_dpu.ctl[i].flush;
+		}
+		dpu_wr(g_dpu.mdss, ctl + CTL_FLUSH, flush);
+		if (g_dpu.ctl_kick_bits & (1u << i)) {
+			dpu_wr(g_dpu.mdss, ctl + CTL_START, 1u);
 		}
 	}
 }
@@ -467,8 +520,6 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 		}
 	}
 
-	dpu_pick_ctls(mdss);
-
 	/*
 	 * Geometry the bootloader left live, read from where the SDE actually
 	 * keeps it: SRC_SIZE/SRC_XY for the source rect, OUT_SIZE/OUT_XY for the
@@ -499,10 +550,12 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 		g_dpu.cur_stride = g_dpu.orig_ystride & 0xffffu;
 		PE_parse_boot_argn("sweetfb_geom", &geom, sizeof(geom));
 		g_dpu.geom_write = geom > 0;
-		g_dpu.linear_vig = dpu_rd(mdss, MDSS_SDE_OFF) == SDE_REV_SM7150 &&
+		const bool active_vig = dpu_rd(mdss, MDSS_SDE_OFF) == SDE_REV_SM7150 &&
 		    (g_dpu.sspp_off == 0x5000u || g_dpu.sspp_off == 0x7000u) &&
 		    g_dpu.src_addr_off == g_dpu.sspp_off + SSPP_SRC0_ADDR &&
-		    multi == 0 && g_dpu.geom_write;
+		    multi == 0;
+		g_dpu.linear_vig = active_vig && g_dpu.geom_write;
+		dpu_pick_ctls(mdss, active_vig);
 		if (g_dpu.linear_vig) {
 			int rebase = 1;
 			PE_parse_boot_argn("sweetfb_rebase", &rebase, sizeof(rebase));
@@ -570,19 +623,19 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 	IOLog("SWEET DPU: dsi0 0x%08x, %u nonzero words\n", DSI0_PA, found);
 	}
 
-	if (g_dpu.ready) {
+	if (sweet_display_can_flip()) {
 		IOLog("SWEET DPU: flip ready on %s SRC_ADDR=+0x%x YSTRIDE=+0x%x "
-		    "SRC_SIZE=+0x%x OUT_SIZE=+0x%x CTL0x%x flush=0x%x %s%s%s "
+		    "SRC_SIZE=+0x%x OUT_SIZE=+0x%x ctls=0x%x sspp_flush=0x%x kick=0x%x%s%s "
 		    "sizes %s\n",
 		    g_dpu.sspp_name ? g_dpu.sspp_name : "?",
 		    g_dpu.src_addr_off, g_dpu.src_stride_off, g_dpu.src_size_off,
 		    g_dpu.out_size_off, g_dpu.ctl_bits, g_dpu.flush_mask,
-		    g_dpu.video_mode ? "video" : "cmd-or-idle",
+		    g_dpu.ctl_kick_bits,
 		    g_dpu.geom_guess ? " geom-guess" : "",
 		    g_dpu.geom_write ? "" : " geom-read-only",
 		    dpu_enc_name());
 	} else {
-		IOLog("SWEET DPU: no SSPP holds the panel PA - flip disabled\n");
+		IOLog("SWEET DPU: no usable SSPP/CTL route, flip disabled\n");
 	}
 }
 
@@ -775,6 +828,7 @@ sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
 			}
 		}
 	}
+	/* These reads verify register writes, not the pitch used by the live fetch. */
 	const uint32_t src = dpu_rd(g_dpu.mdss, g_dpu.src_size_off);
 	const uint32_t src_xy = dpu_rd(g_dpu.mdss, g_dpu.src_xy_off);
 	ystride = dpu_rd(g_dpu.mdss, g_dpu.src_stride_off);

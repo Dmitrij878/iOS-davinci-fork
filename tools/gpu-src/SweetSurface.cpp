@@ -87,6 +87,9 @@ static uint32_t g_flip_count;    /* slots reserved by sweet_surface_flip_pool */
 static uint32_t g_flip_bytes;    /* size of one slot */
 static uint32_t g_flip_used;     /* bit i = slot i handed to a surface */
 static bool g_flip_vm_alloc;
+static struct {
+	uint32_t width, height, stride;
+} g_packed_panel;
 
 #define SWEET_SPLASH_SLOTS      3
 static struct {
@@ -366,9 +369,18 @@ sweet_surface_flip_pool(uint32_t slot_bytes, uint32_t count)
 
 void
 sweet_surface_init_scanout(uint64_t panel_pa, uint64_t panel_bytes,
-    uint32_t slot_bytes, uint32_t count)
+    uint32_t slot_bytes, uint32_t count, const SweetSurface *packed_panel)
 {
 	uint64_t splash[2];
+	IOLockLock(sweet_surface_lock);
+	if (packed_panel != NULL) {
+		g_packed_panel.width = packed_panel->width;
+		g_packed_panel.height = packed_panel->height;
+		g_packed_panel.stride = packed_panel->bytesPerRow;
+	} else {
+		bzero(&g_packed_panel, sizeof(g_packed_panel));
+	}
+	IOLockUnlock(sweet_surface_lock);
 	if (slot_bytes == 0 || (slot_bytes & (page_size - 1)) != 0) {
 		return;
 	}
@@ -581,14 +593,25 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	    s->bytesPerElement > 64 || s->elementWidth == 0 || s->elementHeight == 0) {
 		return kIOReturnBadArgument;
 	}
-	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow",
-	    sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement));
+	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+	uint32_t default_stride = sweet_row_bytes(s->width, s->elementWidth, s->bytesPerElement);
+	if (s->pixelFormat == 0x42475241u && s->bytesPerElement == 4 &&
+	    s->elementWidth == 1 && s->elementHeight == 1 &&
+	    (planes == NULL || planes->getCount() == 0)) {
+		IOLockLock(sweet_surface_lock);
+		if (g_packed_panel.stride != 0 && s->width == g_packed_panel.width &&
+		    s->height == g_packed_panel.height) {
+			default_stride = g_packed_panel.stride;
+		}
+		IOLockUnlock(sweet_surface_lock);
+	}
+	/* An explicit pitch is part of the producer's memory layout. */
+	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow", default_stride);
 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
 		return kIOReturnBadArgument;
 	}
 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
 
-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
 	s->planeCount = 0;
 	if (planes != NULL) {
 		uint64_t next = s->offset;

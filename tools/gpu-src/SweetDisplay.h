@@ -40,10 +40,11 @@ bool sweet_display_can_flip(void);
  * from the CAF SSPP offsets used by the probe. SM7150 VIG gets explicit
  * linear BGRA8 fetch and 1:1 scaling state. For aligned buffers, whole
  * 64-byte units of the crop are folded into SRC_ADDR (sweetfb_rebase=0
- * keeps the original crop registers for comparison). The fetch registers
- * are read back after flushing the live CTLs.
+ * keeps the original crop registers for comparison). On SM7150 VIG, the
+ * commit flushes the routed SSPP, mixer, CTL and active interface. Fetch
+ * register readback checks the programmed values.
  * Returns false if the probe did not find a layer, the DPU mapping is gone, or
- * the write did not latch (the plane is restored and the flip disabled).
+ * the readback differs (the plane is restored and the flip disabled).
  */
 bool sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
     uint32_t width, uint32_t height);

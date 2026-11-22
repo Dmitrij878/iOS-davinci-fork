@@ -1,5 +1,44 @@
 # iOS 16 XNU port (shared SWEET baseline, DAVINCI target) - working notes
 
+## Agent handoff / DAVINCI DPU 0107 stride (2026-11-22)
+
+- User booted `/mnt/wrk/davinci-ios-dpu0106-boot.img` (SHA-256
+  `b58d4aa982aef33b815452e12ba26180034579633c1653aa582a5b1e37030226`).
+  The 0106 kernel from [CI run 45007873122](https://github.com/Dmitrij878/iOS-davinci-fork/actions/runs/45007873122)
+  at `ac0b8e9` has SHA-256
+  `0cddee983b15ea98a7d0403c5a9024d97e0c60dbaffa9e2d5dcc4262df1f932e`.
+  User confirmed SpringBoard reached Home with a visible status bar and
+  alert card. Color and pixel packing are clean. Scanlines show a 72-pixel
+  diagonal step, consistent with a 288-byte difference between the
+  producer pitch of 4608 and the splash pitch of 4320.
+- The recovery log identifies CTL0 and VIG0 with YSTRIDE at MDSS+0x5024.
+  `/tmp/dpu0106.log` shows LM0 staging VIG0 (`0x01000005`), command-mode
+  CTL_TOP (`0x00020000`), and active INTF1 (`0x2`). The first two flips
+  read back YSTRIDE `0x1200` and the rebased slot addresses. That confirms
+  the programmed registers. The effective fetch pitch is inferred from
+  the panel artifact. The old commit issued only the VIG0 flush bit and
+  inferred command mode from counters.
+- `0107-davinci-dpu-stride-fix.patch` follows the SM7150 VIG route and
+  derives the kickoff mode from CTL_TOP. On this route it writes
+  CTL0_INTF_FLUSH `0x2`, CTL0_FLUSH `0x80020041` (VIG0, LM0, CTL and
+  INTF), then CTL0_START `1`. The same commit path restores the splash
+  fetch. Route diagnostics record flush and start readback. The full
+  flush is a candidate fix for the effective pitch and needs a panel test.
+- Keep the default iPhone X layout for the first test. Its 1125-pixel BGRA
+  rows require at least 4500 bytes, so 4320 is invalid for those surfaces.
+  For the separate packed-pitch test, pair `sweetfb_native=1` with a native
+  highmem ADT (keep the restored D22AP /product). AppleCLCD reports
+  1080x2340 and IOCoreSurfaceRoot defaults matching nonplanar BGRA to
+  4320 bytes per row. Explicit producer pitches are honored, so a
+  padded surface falls back to the panel's 4320-byte CPU copy. Check for
+  `bpr 4320` and a direct flip at `stride 4320` before counting a native
+  test as zero-copy. Earlier native runs showed UIKit status-bar issues.
+- Offline: all patch hunk headers passed, 0099–0107 applied in order and
+  the five reconstructed files byte-matched `tools/gpu-src/`. Host
+  mocks passed ordered CTL writes, command/video kickoff, route selection,
+  restore, both pitches, and IOSurface layout with explicit and omitted
+  pitches. 0107 has not been booted.
+
 ## Agent handoff / DAVINCI DPU 0105 boot and 0106 follow-up (2026-11-22)
 
 - 0105 kernel built in [CI run 44931013942](https://github.com/Dmitrij878/iOS-davinci-fork/actions/runs/44931013942)
@@ -99,6 +138,59 @@
 
 ## Agent handoff / DAVINCI work (2026-11-19)
 
+- User-approved Skip Setup test: cloned
+  `/mnt/wrk/davinci-iosroot-migration.img` to
+  `/mnt/wrk/davinci-iosroot-skip-setup.img` and applied
+  `tools/sweet-root-tweaks.py` to the copy only. The script marked Setup
+  complete, disabled MiniBuddy/cloud-configuration UI, enabled SpringBoard
+  no-watchdogs / a PurpleBuddy watchdog exception, removed CommCenter jobs,
+  disabled VirtualAudio and recorder-server startup, and added expected
+  container directories. Its activation-data step was skipped because the
+  image has no mobileactivationd system container. HFS+ `fsck -fn` passed;
+  sparse-image round-trip was byte-identical.
+  Raw SHA-256:
+  `105afbfafe76da44540bfb7f2a713c40923116fdb6eb3d84501619b48a7613d6`;
+  sparse SHA-256:
+  `be15a7a307c258014adc720fd2f639293ef50e015af1a3f720cecdd678e075ec`.
+  With explicit user approval, flashed only `userdata` using fastboot
+  (`-S 512M`, 24/24 chunks OKAY; 367.909 s). No other partition was written.
+  Then temporarily booted
+  `/mnt/wrk/davinci-ios-multicore-touch-boot.img` with `fastboot boot` (SHA-256
+  `b3ea6c17d3fa7ff83d15309b90204e17dbbbb214e4db243cb669707909df3d0a`);
+  fastboot returned OKAY. User confirmed Setup was bypassed and the iOS Home
+  screen appeared. This confirms userland reached Home with the Skip Setup
+  preferences. User now reports touch and swipes work and Settings and Safari
+  launch, but neither is practically useful yet. Network access and broader
+  app functionality are not confirmed.
+- Wi-Fi investigation (read-only; no persistent device writes or reboot):
+  [HakiOS's davinci notes](https://github.com/devaxto/hakios-davinci/blob/main/docs/DAVINCI.md)
+  identify WCN3990 behind ICNSS. Its `hakios.wifi.c`, `hakios.lx.c`, and
+  `tools/mk-ath10k.py` contain a davinci-specific SM7150/MPSS/ath10k path,
+  but HakiOS explicitly says it has not run on davinci. The path expects
+  `modem.mdt`, `wlanmdsp.mbn`, `firmware-5.bin`, and board data; the exact
+  `bdwlan.*` choice remains unresolved. HakiOS's `MPSS_FW` build also
+  requires `nv-modemst1`, `nv-modemst2`, `nv-fsg`, and `nv-fsc`. With
+  explicit user consent, those four partitions were read-only copied to a
+  private local directory (directory mode 0700, files mode 0600); their
+  contents and hashes must not be logged, shared, or committed. Firmware and
+  BDF candidates were also copied locally, outside this repository.
+- Recovery mapping was corrected before extracting firmware:
+  `/dev/block/mapper/vendor` (`dm-1`, backed by `sda24`, 804,024,320 bytes)
+  is the active logical vendor image. `/dev/block/by-name/vendor` points to
+  `sda23`, which is not that logical view; the earlier raw `sda23` dump and
+  its `e2fsck` errors do not establish that the active vendor image is
+  damaged. The active vendor image was mounted only with `ro,noload`; the
+  modem partition (`/dev/block/by-name/modem`, 335,544,320 bytes, vfat) was
+  mounted read-only. Its `image/` contains `modem.mdt`, `wlanmdsp.mbn`, and
+  `bdwlan.*` / `bd_f*.bin` candidates. Vendor has the WLAN config and
+  symlinks, but neither mounted partition contains `firmware-5.bin`. Both
+  mounts were closed afterward. The live Recovery device tree exposes the
+  ICNSS node but no `board-id`/WLAN selector, so the correct BDF cannot yet be
+  selected safely. No Wi-Fi code or firmware was added to this repository.
+- Linux-firmware's WCN3990 `firmware-5.bin` entry is a 60-byte redistributable
+  Qualcomm Atheros artifact, but it is not on the phone's mounted partitions.
+  Verify the exact firmware/descriptor expected by the HakiOS path before
+  using it; board-data selection and runtime bring-up are still unverified.
 - Use the `gpu-bringup` source at `cd128b2`, not the older `main` branch.
   GitHub Actions run [42659894924](https://github.com/devaxto/ios-davinci/actions/runs/42659894924)
   built the XNU kernel through patch 0104; its `xnu-kernel` artifact is
