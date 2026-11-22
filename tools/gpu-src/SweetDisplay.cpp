@@ -62,6 +62,13 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
 #define CTL_FLUSH           0x018u
 #define CTL_START           0x01Cu
 #define CTL_LAYER           0x000u
+#define SSPP_ADDR_ALIGN     64u
+
+/* Vendor SDE packs counts minus one and treats DRM ARGB8888 as bytes BGRA. */
+#define SSPP_UNPACK_COUNT(n) (((n) - 1u) << 12)
+#define SSPP_BYTES_PER_PIXEL(n) (((n) - 1u) << 9)
+#define SSPP_LINEAR_BGRA8888 ((1u << 17) | SSPP_UNPACK_COUNT(4) | \
+    SSPP_BYTES_PER_PIXEL(4) | (1u << 8) | 0xffu)
 
 /*
  * The vendor packing is (h << 16) | w for sizes and (y << 16) | x for
@@ -123,8 +130,8 @@ static const struct {
 	uint32_t off;
 	uint32_t value;
 } kLinearVig[] = {
-	{ SSPP_SRC_FORMAT,       0x000237ffu },
-	{ SSPP_SRC_UNPACK,       0x03020001u },
+	{ SSPP_SRC_FORMAT,       SSPP_LINEAR_BGRA8888 },
+	{ SSPP_SRC_UNPACK,       0x03020001u }, /* byte lanes B, G, R, A */
 	{ SSPP_SRC_OP_MODE,      1u << 31 }, /* software pixel extension only */
 	{ SSPP_FETCH_CONFIG,     0x87u },
 	{ SSPP_DECIMATION,       0 },
@@ -175,6 +182,7 @@ struct sweet_dpu_state {
 	int         ready;
 	int         disabled;       /* a flip failed to latch, stay on CPU copy */
 	bool        linear_vig;
+	bool        rebase_crop;
 	const char *sspp_name;
 };
 
@@ -266,6 +274,38 @@ static const uint32_t kCtlOffsets[] = { 0x02000u, 0x02200u, 0x02400u, 0x02600u }
 
 /* sweetdpu=1: discover quietly. sweetdpu=2: dump every nonzero register. */
 static int g_dpu_verbose;
+
+/* Read the SM7150 route without changing the bootloader's links or DSC PPS. */
+static void
+dpu_log_route(const char *phase)
+{
+	vm_offset_t base = g_dpu.mdss;
+	IOLog("SWEET DPU: %s route top intf=%08x split=%08x upper=%08x lower=%08x "
+	    "ppb0=%08x ppb1=%08x dce=%08x\n",
+	    phase, dpu_rd(base, MDSS_SDE_OFF + 0x004), dpu_rd(base, MDSS_SDE_OFF + 0x2f4),
+	    dpu_rd(base, MDSS_SDE_OFF + 0x2f8), dpu_rd(base, MDSS_SDE_OFF + 0x3f0),
+	    dpu_rd(base, MDSS_SDE_OFF + 0x330), dpu_rd(base, MDSS_SDE_OFF + 0x338),
+	    dpu_rd(base, MDSS_SDE_OFF + 0x450));
+	for (unsigned int i = 0; i < sizeof(kCtlOffsets) / sizeof(kCtlOffsets[0]); i++) {
+		uint32_t ctl = kCtlOffsets[i];
+		if ((g_dpu.ctl_bits & (1u << i)) == 0) {
+			continue;
+		}
+		IOLog("SWEET DPU: %s ctl%u lm0=%08x lm1=%08x lm2=%08x lm3=%08x top=%08x "
+		    "merge=%08x dsc=%08x intf=%08x\n", phase, i,
+		    dpu_rd(base, ctl), dpu_rd(base, ctl + 4), dpu_rd(base, ctl + 8),
+		    dpu_rd(base, ctl + 0xc), dpu_rd(base, ctl + 0x14),
+		    dpu_rd(base, ctl + 0xe4), dpu_rd(base, ctl + 0xe8),
+		    dpu_rd(base, ctl + 0xf4));
+	}
+	for (unsigned int i = 0; i < 2; i++) {
+		uint32_t lm = 0x45000 + i * 0x1000;
+		uint32_t dsc = 0x81000 + i * 0x400;
+		IOLog("SWEET DPU: %s lm%u mode=%08x size=%08x dsc%u mode=%08x picture=%08x slice=%08x\n",
+		    phase, i, dpu_rd(base, lm), dpu_rd(base, lm + 4), i,
+		    dpu_rd(base, dsc), dpu_rd(base, dsc + 8), dpu_rd(base, dsc + 0xc));
+	}
+}
 
 static void
 dpu_dump_block(vm_offset_t base, const struct sweet_dpu_block *b,
@@ -464,6 +504,10 @@ sweet_display_probe(uint64_t fb_phys, uint32_t fb_stride,
 		    g_dpu.src_addr_off == g_dpu.sspp_off + SSPP_SRC0_ADDR &&
 		    multi == 0 && g_dpu.geom_write;
 		if (g_dpu.linear_vig) {
+			int rebase = 1;
+			PE_parse_boot_argn("sweetfb_rebase", &rebase, sizeof(rebase));
+			g_dpu.rebase_crop = rebase != 0;
+			dpu_log_route("boot");
 			for (unsigned int i = 0; i < sizeof(kLinearVig) / sizeof(kLinearVig[0]); i++) {
 				uint32_t off = kLinearVig[i].off;
 				g_dpu.orig_vig[i] = dpu_rd(mdss, g_dpu.sspp_off + off);
@@ -652,6 +696,22 @@ sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
 	if (g_dpu.linear_vig && (width != g_dpu.panel_w || height != g_dpu.panel_h)) {
 		return false;
 	}
+	/*
+	 * Keep the panel-sized fetch close to the splash layout. Move the crop
+	 * offset to SRC_ADDR in 64-byte units, with only the remainder in SRC_XY.
+	 * A 64-byte aligned stride keeps that remainder on the same source row.
+	 */
+	if (g_dpu.rebase_crop && stride != 0 &&
+	    ((phys | stride) & (SSPP_ADDR_ALIGN - 1)) == 0) {
+		const uint64_t offset = (uint64_t)y * stride + (uint64_t)x * 4u;
+		const uint64_t rebased = phys + (offset & ~(uint64_t)(SSPP_ADDR_ALIGN - 1));
+		if (rebased > UINT32_MAX) {
+			return false;
+		}
+		phys = (uint32_t)rebased;
+		x = (uint32_t)(offset & (SSPP_ADDR_ALIGN - 1)) / 4u;
+		y = 0;
+	}
 	const bool setup_linear = g_dpu.linear_vig && !g_dpu.dirty;
 	const uint32_t pixel_ext_size = (height << 16) | width;
 	if (g_dpu.cur_pa == phys && g_dpu.dirty &&
@@ -715,10 +775,16 @@ sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
 			}
 		}
 	}
-	if (latched != phys || (wrote_size &&
-	    out != dpu_size_pack(width, height, g_dpu.size_enc))) {
-		IOLog("SWEET DPU: flip did not stick (addr 0x%08x/0x%08x out "
-		    "0x%08x), restoring and disabling\n", latched, phys, out);
+	const uint32_t src = dpu_rd(g_dpu.mdss, g_dpu.src_size_off);
+	const uint32_t src_xy = dpu_rd(g_dpu.mdss, g_dpu.src_xy_off);
+	ystride = dpu_rd(g_dpu.mdss, g_dpu.src_stride_off);
+	if (latched != phys ||
+	    (stride != 0 && (ystride & 0xffffu) != stride) ||
+	    (g_dpu.geom_write && (src != g_dpu.cur_src_size || out != g_dpu.cur_src_size ||
+	    src_xy != dpu_xy_pack(x, y, g_dpu.size_enc)))) {
+		IOLog("SWEET DPU: flip did not stick (addr 0x%08x/0x%08x src 0x%08x out "
+		    "0x%08x xy 0x%08x stride 0x%08x), restoring and disabling\n",
+		    latched, phys, src, out, src_xy, ystride);
 		dpu_restore();
 		g_dpu.disabled = 1;
 		return false;
@@ -739,6 +805,9 @@ sweet_display_flip(uint32_t phys, uint32_t stride, uint32_t x, uint32_t y,
 		    wrote_size ? " (window programmed)" : "");
 		if (g_dpu.flips_logged == 1) {
 			dpu_dump_sspp();
+			if (g_dpu.linear_vig) {
+				dpu_log_route("after flip");
+			}
 		}
 	}
 	g_dpu.cur_pa = phys;

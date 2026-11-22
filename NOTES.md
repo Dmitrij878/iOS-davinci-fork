@@ -1,5 +1,43 @@
 # iOS 16 XNU port (shared SWEET baseline, DAVINCI target) - working notes
 
+## Agent handoff / DAVINCI DPU 0105 boot and 0106 follow-up (2026-11-22)
+
+- 0105 kernel built in [CI run 44931013942](https://github.com/Dmitrij878/iOS-davinci-fork/actions/runs/44931013942)
+  at `883480f`. Local kernel `xnu/out-0105/kernel.development.sweet`,
+  SHA-256 `001716930f014f8c9a36f3a06d080602e45c48115e1ef0ef5ab3b1c32888f160`.
+  The tested `/mnt/wrk/davinci-ios-dpu0105-boot.img` has SHA-256
+  `fd3f7b9425fd47fce249a155b7c4b00371f6b1414645036ba452eecfd91611e7`.
+  Its highmem ADT has the iPhone X `/product` restored from `d22ap.adt`.
+- User confirmed SpringBoard reached Home without crashes. The local USB
+  capture `/tmp/dpu0105-prod.log` shows both IOSurfaces in reserved slots
+  (`0xfb800000` and `0xfc400000`) and flips 4–8 alternating between them
+  without CPU crop-copy. The image still shows fine vertical striping and
+  horizontal stretching during hardware flips. The bright green vertical
+  line at x=540 is physical OLED panel damage, visible in fastboot and
+  recovery too. Exclude that line when judging the scanout changes.
+- The 0105 flip and the earlier CPU-copy boot probe
+  (`/mnt/wrk/davinci-recovery-log.txt`) agree on format `0x000237ff`
+  and unpack `0x03020001`. Qualcomm's linear DRM ARGB8888 entry describes
+  BGRA bytes in memory. Bits [13:12] and [10:9] both contain 3, the encoded
+  value for four unpacked components and four bytes per pixel. The splash
+  pitch is 4320 bytes and IOSurface's actual pitch is 4608 bytes. Keep
+  4608 when flipping directly from those surfaces.
+- Patch `0106-davinci-dpu-pixel-format-fix.patch` preserves that format and
+  pitch and tests a different representation of the same crop. For the
+  two observed slots, the DPU receives `0xfb836040` and `0xfc436040`
+  with `SRC_XY=(6,0)` instead of the slot base with `SRC_XY=(22,48)`.
+  The effective byte offsets match and the programmed addresses stay
+  64-byte aligned. The patch checks fetch readback and logs compact
+  boot and post-flip CTL, LM, split-display, pingpong routing and DSC
+  state. The old probe shows CTL0/VIG0 for the source but does not show
+  whether downstream DSC is split. The patch leaves that topology intact.
+- The 0099–0106 patch chain and host DPU register mock passed. Clean direct
+  scanout needs a 0106 kernel build and hardware test. Use the same highmem
+  ADT with `/product` and the two scanout slots. Compare the default rebased
+  fetch against `sweetfb_rebase=0` if stripes persist. The effective crop
+  equivalence is verified offline. A hardware issue handling the original
+  crop origin remains a hypothesis.
+
 ## Agent handoff / DAVINCI USB logging and DPU 0104 (2026-11-21)
 
 - User confirmed that the davinci USB test with `sweetusb=2` brought up

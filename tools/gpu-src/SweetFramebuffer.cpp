@@ -668,8 +668,10 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		s->release();
 		return false;
 	}
-	if (s->memory == NULL ||
-	    (uint64_t)s->bytesPerRow * s->height > s->memory->getLength()) {
+	const uint64_t scanout_end = (uint64_t)(crop_y + fb->fHeight - 1) * s->bytesPerRow +
+	    (uint64_t)(crop_x + fb->fWidth) * 4u;
+	if (s->memory == NULL || s->offset + scanout_end > s->memory->getLength() ||
+	    phys + scanout_end > 0x100000000ull) {
 		s->release();
 		return false;
 	}

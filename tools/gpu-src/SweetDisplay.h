@@ -38,8 +38,10 @@ bool sweet_display_can_flip(void);
  * The window is programmed, not inherited: SRC_SIZE and OUT_SIZE get the
  * panel rect (each only when the register differs) and SRC_XY the crop origin,
  * from the CAF SSPP offsets used by the probe. SM7150 VIG gets explicit
- * linear BGRA8 fetch and 1:1 scaling state. SRC_ADDR is written and read
- * back after flushing the live CTLs.
+ * linear BGRA8 fetch and 1:1 scaling state. For aligned buffers, whole
+ * 64-byte units of the crop are folded into SRC_ADDR (sweetfb_rebase=0
+ * keeps the original crop registers for comparison). The fetch registers
+ * are read back after flushing the live CTLs.
  * Returns false if the probe did not find a layer, the DPU mapping is gone, or
  * the write did not latch (the plane is restored and the flip disabled).
  */
