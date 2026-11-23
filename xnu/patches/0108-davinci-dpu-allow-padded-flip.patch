@@ -1,0 +1,45 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -121,6 +121,7 @@
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	bool          fPackedScanout;
++	bool          fPackedOnly;
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -200,6 +201,9 @@
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+ 	fPackedScanout = native && fWidth == 1080 && fHeight == 2340 && fRowBytes == fWidth * 4;
++	int packed_only = 0;
++	PE_parse_boot_argn("sweetfb_packed", &packed_only, sizeof(packed_only));
++	fPackedOnly = fPackedScanout && packed_only != 0;
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+@@ -668,7 +672,7 @@
+ 		return false;
+ 	}
+ 	if (s->bytesPerRow == 0 || s->bytesPerRow > 0xffffu ||
+-	    (fb->fPackedScanout && s->bytesPerRow != fb->fRowBytes)) {
++	    (fb->fPackedOnly && s->bytesPerRow != fb->fRowBytes)) {
+ 		s->release();
+ 		return false;
+ 	}
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -606,7 +606,12 @@
+ 		IOLockUnlock(sweet_surface_lock);
+ 	}
+ 	/* An explicit pitch is part of the producer's memory layout. */
+-	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow", default_stride);
++	int force_stride = 0;
++	PE_parse_boot_argn("sweetfb_forcestride", &force_stride, sizeof(force_stride));
++	if (force_stride != 0 && default_stride == 1080 * 4)
++		s->bytesPerRow = default_stride;
++	else
++		s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow", default_stride);
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}

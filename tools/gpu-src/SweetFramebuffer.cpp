@@ -121,6 +121,7 @@ public:
 	uint32_t      fWidth, fHeight, fRowBytes;
 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
 	bool          fPackedScanout;
+	bool          fPackedOnly;
 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
 	IOMemoryMap  *fMap;
@@ -200,6 +201,9 @@ AppleCLCD::start(IOService *provider)
 		fLogicalH = SWEET_FB_LOGICAL_H;
 	}
 	fPackedScanout = native && fWidth == 1080 && fHeight == 2340 && fRowBytes == fWidth * 4;
+	int packed_only = 0;
+	PE_parse_boot_argn("sweetfb_packed", &packed_only, sizeof(packed_only));
+	fPackedOnly = fPackedScanout && packed_only != 0;
 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
 	fLock = IOLockAlloc();
@@ -668,7 +672,7 @@ sweet_fb_try_flip(AppleCLCD *fb, const uint8_t *rec)
 		return false;
 	}
 	if (s->bytesPerRow == 0 || s->bytesPerRow > 0xffffu ||
-	    (fb->fPackedScanout && s->bytesPerRow != fb->fRowBytes)) {
+	    (fb->fPackedOnly && s->bytesPerRow != fb->fRowBytes)) {
 		s->release();
 		return false;
 	}

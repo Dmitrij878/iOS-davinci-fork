@@ -606,7 +606,12 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 		IOLockUnlock(sweet_surface_lock);
 	}
 	/* An explicit pitch is part of the producer's memory layout. */
-	s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow", default_stride);
+	int force_stride = 0;
+	PE_parse_boot_argn("sweetfb_forcestride", &force_stride, sizeof(force_stride));
+	if (force_stride != 0 && default_stride == 1080 * 4)
+		s->bytesPerRow = default_stride;
+	else
+		s->bytesPerRow = sweet_dict_u32(props, "IOSurfaceBytesPerRow", default_stride);
 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
 		return kIOReturnBadArgument;
 	}
